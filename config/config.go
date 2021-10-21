@@ -7,6 +7,9 @@ import (
 var Config = struct {
 	DebugMode bool `default:"false" env:"DEBUG_MODE"`
 	Port      int  `default:"7766" env:"PORT"`
+	Cluster   struct {
+		Port int `default:"10110" env:"CLUSTER_PORT"`
+	}
 }{}
 
 func init() {

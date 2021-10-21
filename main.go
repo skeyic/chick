@@ -2,11 +2,8 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"github.com/golang/glog"
-	"github.com/skeyic/chick/app/router"
 	"github.com/skeyic/chick/cluster"
-	"github.com/skeyic/chick/config"
 )
 
 func main() {
@@ -14,9 +11,16 @@ func main() {
 		myID = cluster.NodeID
 	)
 
+	nodes := flag.String("cluster", "http://127.0.0.1:9021", "comma separated cluster peers")
+	id := flag.Int("id", 1, "node ID")
+	kvport := flag.Int("port", 9121, "key-value server port")
+	join := flag.Bool("join", false, "join an existing cluster")
+
 	flag.Parse()
 
-	r := router.InitRouter()
+	cluster.StartServe(*nodes, *id, *kvport, *join)
+
+	//r := router.InitRouter()
 	glog.V(4).Infof("CHICK %s starts...", myID)
-	glog.Fatal(r.Run(fmt.Sprintf(":%d", config.Config.Port)))
+	//glog.Fatal(r.Run(fmt.Sprintf(":%d", config.Config.Port)))
 }
