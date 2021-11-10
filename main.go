@@ -13,14 +13,17 @@ func main() {
 
 	nodes := flag.String("cluster", "http://127.0.0.1:9021", "comma separated cluster peers")
 	id := flag.Int("id", 1, "node ID")
-	kvport := flag.Int("port", 9121, "key-value server port")
+	//kvport := flag.Int("port", 9121, "key-value server port")
 	join := flag.Bool("join", false, "join an existing cluster")
 
 	flag.Parse()
 
-	cluster.StartServe(*nodes, *id, *kvport, *join)
+	//cluster.StartServe(*nodes, *id, *kvport, *join)
+	cluster.StartChickServe(*nodes, *id, *join)
 
 	//r := router.InitRouter()
 	glog.V(4).Infof("CHICK %s starts...", myID)
 	//glog.Fatal(r.Run(fmt.Sprintf(":%d", config.Config.Port)))
+
+	<-make(chan struct{}, 1)
 }

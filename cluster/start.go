@@ -21,3 +21,7 @@ func StartServe(cluster string, id, kvport int, join bool) {
 	// the key-value http handler will propose updates to raft
 	serveHttpKVAPI(kvs, kvport, confChangeC, errorC)
 }
+
+func StartChickServe(cluster string, id int, join bool) {
+	newChickNode(id, strings.Split(cluster, ","), join)
+}
