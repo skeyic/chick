@@ -16,10 +16,13 @@ func main() {
 	//kvport := flag.Int("port", 9121, "key-value server port")
 	join := flag.Bool("join", false, "join an existing cluster")
 
+	flag.Set("logtostderr", "true")
+	flag.Set("v", "10")
+
 	flag.Parse()
 
 	//cluster.StartServe(*nodes, *id, *kvport, *join)
-	cluster.StartChickServe(*nodes, *id, *join)
+	cluster.StartOwlServe(*nodes, *id, *join)
 
 	//r := router.InitRouter()
 	glog.V(4).Infof("CHICK %s starts...", myID)

@@ -25,3 +25,15 @@ func StartServe(cluster string, id, kvport int, join bool) {
 func StartChickServe(cluster string, id int, join bool) {
 	newChickNode(id, strings.Split(cluster, ","), join)
 }
+
+func StartOwlServe(cluster string, id int, join bool) {
+	proposeC := make(chan string)
+	//defer close(proposeC)
+	confChangeC := make(chan raftpb.ConfChange)
+	//defer close(confChangeC)
+
+	commitC, errorC, _ := newRaftNode(id, strings.Split(cluster, ","), join, nil, proposeC, confChangeC)
+
+	owls := newOwl(proposeC, commitC, errorC)
+	owls.live()
+}
