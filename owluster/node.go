@@ -1,7 +1,6 @@
 package owluster
 
 import (
-	"fmt"
 	"github.com/golang/glog"
 	"math/rand"
 	"net"
@@ -123,68 +122,69 @@ func (rf *Raft) start() {
 	rf.toLeaderC = make(chan bool)
 
 	// state change and handle RPC
-	go func() {
-		rand.Seed(time.Now().UnixNano())
+	go rf.step()
+}
 
-		for {
-			switch rf.state {
-			case Follower:
-				select {
-				case <-rf.heartbeatC:
-					glog.V(4).Infof("follower-%d received heartbeat", rf.me)
+func (rf *Raft) step() {
+	rand.Seed(time.Now().UnixNano())
 
-				case <-time.After(time.Duration(rand.Intn(500-300)+300) * time.Millisecond):
-					glog.V(4).Infof("follower-%d timeout", rf.me)
-					rf.state = Candidate
-				}
+	for {
+		switch rf.state {
+		case Follower:
+			glog.V(4).Infof("follower-%d is a follower", rf.me)
+			select {
+			case <-rf.heartbeatC:
+				glog.V(4).Infof("follower-%d receives heartbeat", rf.me)
 
-			case Candidate:
-				glog.V(4).Infof("follower-%d is candidate", rf.me)
-
-				rf.currentTerm++
-				rf.votedFor = rf.me
-				rf.voteCount = 1
-
-				go rf.broadcastRequestVote()
-
-				select {
-				case <-time.After(time.Duration(rand.Intn(5000-300)+300) * time.Millisecond):
-					rf.state = Follower
-				case <-rf.toLeaderC:
-					glog.V(4).Infof("follower-%d is leader", rf.me)
-					rf.state = Leader
-
-					rf.nextIndex = make([]int, len(rf.nodes))
-					rf.matchIndex = make([]int, len(rf.nodes))
-
-					for i := range rf.nodes {
-						rf.nextIndex[i] = 1
-						rf.matchIndex[i] = 0
-					}
-
-					go func() {
-						i := 0
-						for {
-							i++
-							rf.log = append(rf.log,
-								LogEntry{
-									LogTerm:  rf.currentTerm,
-									LogIndex: i,
-									LogCMD:   fmt.Sprintf("send: %d", i),
-								})
-							time.Sleep(3 * time.Second)
-						}
-					}()
-				}
-
-			case Leader:
-				rf.broadcastHeartbeat()
-				time.Sleep(100 * time.Millisecond)
+			case <-time.After(time.Duration(rand.Intn(500-300)+300) * time.Millisecond):
+				glog.V(4).Infof("follower-%d receives heartbeat timeout, Follower => Candidate", rf.me)
+				rf.state = Candidate
 			}
+
+		case Candidate:
+			rf.currentTerm++
+			rf.votedFor = rf.me
+			rf.voteCount = 1
+			glog.V(4).Infof("follower-%d is a candidate, vote for myself, my term: %d", rf.me, rf.currentTerm)
+
+			go rf.broadcastRequestVote()
+
+			select {
+			case <-time.After(time.Duration(rand.Intn(5000-300)+300) * time.Millisecond):
+				glog.V(4).Infof("follower-%d requests vote timeout, Candidate => Follower", rf.me)
+				rf.state = Follower
+			case <-rf.toLeaderC:
+				glog.V(4).Infof("follower-%d wins the vote, Candidate => Leader", rf.me)
+				rf.state = Leader
+
+				rf.nextIndex = make([]int, len(rf.nodes))
+				rf.matchIndex = make([]int, len(rf.nodes))
+
+				for i := range rf.nodes {
+					rf.nextIndex[i] = 1
+					rf.matchIndex[i] = 0
+				}
+
+				go func() {
+					i := 0
+					for {
+						i++
+						rf.log = append(rf.log,
+							LogEntry{
+								LogTerm:  rf.currentTerm,
+								LogIndex: i,
+							})
+						time.Sleep(3 * time.Second)
+					}
+				}()
+			}
+
+		case Leader:
+			glog.V(4).Infof("follower-%d is a leader, send heartbeat", rf.me)
+			rf.broadcastHeartbeat()
+			time.Sleep(100 * time.Millisecond)
 		}
-
-	}()
-
+	}
 }
 
 type VoteArgs struct {
@@ -195,11 +195,6 @@ type VoteArgs struct {
 type VoteReply struct {
 	Term        int
 	VoteGranted bool
-	// TEST
-	Me          int
-	State       State
-	CurrentTerm int
-	VoteFor     int
 }
 
 func (rf *Raft) broadcastRequestVote() {
@@ -218,7 +213,6 @@ func (rf *Raft) broadcastRequestVote() {
 			rf.sendRequestVote(i, args, reply)
 		}(i)
 	}
-
 }
 
 func (rf *Raft) sendRequestVote(serverID int, args VoteArgs, reply *VoteReply) {
@@ -227,8 +221,8 @@ func (rf *Raft) sendRequestVote(serverID int, args VoteArgs, reply *VoteReply) {
 	)
 	client, err := rpc.DialHTTP("tcp", address)
 	if err != nil {
-		// TODO here is a FATAL
-		glog.Fatalf("failed to dial %s with error %v", address, err)
+		glog.Errorf("failed to dial %s with error %v", address, err)
+		return
 	}
 	defer client.Close()
 
@@ -238,7 +232,7 @@ func (rf *Raft) sendRequestVote(serverID int, args VoteArgs, reply *VoteReply) {
 		glog.Errorf("failed to call %s with error %v", "Raft.RequestVote", err)
 		return
 	}
-	glog.V(4).Infof("REPLY: %+v", reply)
+	glog.V(4).Infof("REPLY: %+v, MY TERM: %d", reply, rf.currentTerm)
 
 	if reply.Term > rf.currentTerm {
 		rf.currentTerm = reply.Term
@@ -250,7 +244,7 @@ func (rf *Raft) sendRequestVote(serverID int, args VoteArgs, reply *VoteReply) {
 	if reply.VoteGranted {
 		rf.voteCount++
 
-		if rf.voteCount > len(rf.nodes)/2+1 {
+		if rf.voteCount >= len(rf.nodes)/2+1 {
 			rf.toLeaderC <- true
 		}
 	}
@@ -315,8 +309,8 @@ func (rf *Raft) sendHeartbeat(serverID int, args HeartbeatArgs, reply *Heartbeat
 	)
 	client, err := rpc.DialHTTP("tcp", address)
 	if err != nil {
-		// TODO here is a FATAL
-		glog.Fatalf("failed to dial %s with error %v", address, err)
+		glog.Errorf("failed to dial %s with error %v", address, err)
+		return
 	}
 	defer client.Close()
 
@@ -380,11 +374,6 @@ func (rf *Raft) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
 }
 
 func (rf *Raft) RequestVote(args VoteArgs, reply *VoteReply) error {
-	reply.Me = rf.me
-	reply.State = rf.state
-	reply.CurrentTerm = rf.currentTerm
-	reply.VoteFor = rf.votedFor
-
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
