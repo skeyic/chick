@@ -13,7 +13,7 @@ import (
 func TestRPC(t *testing.T) {
 	utils.EnableGlogForTesting()
 
-	rpc.Register(new(Raft))
+	rpc.Register(new(Owl))
 	rpc.HandleHTTP()
 	l, e := net.Listen("tcp", ":9001")
 	if e != nil {
@@ -31,9 +31,9 @@ func TestRPCClient2(t *testing.T) {
 		log.Fatal("dialing:", err)
 	}
 
-	args := &VoteArgs{999, 1}
+	args := &VoteArgs{999, 1, 1, false}
 	var reply = new(VoteReply)
-	err = client.Call("Raft.RequestVote", args, &reply)
+	err = client.Call("Owl.RequestVote", args, &reply)
 	if err != nil {
 		log.Fatal("RequestVote error:", err)
 	}
