@@ -1,13 +1,21 @@
 package owluster
 
 import (
+	"errors"
 	"github.com/golang/glog"
 	"math/rand"
 	"net"
 	"net/http"
 	"net/rpc"
 	"strings"
+	"sync"
 	"time"
+)
+
+// Errors ..
+var (
+	errRPCConnectFailed = errors.New("failed to connect through RPC")
+	errLeaderNotElected = errors.New("leader not elected")
 )
 
 // node cluster node
@@ -19,7 +27,7 @@ type node struct {
 // State int
 type State int
 
-// Follower,Candidate,Leader
+// Follower, PreCandidate, Candidate, Leader
 const (
 	Follower State = iota + 1
 	PreCandidate
@@ -38,7 +46,7 @@ type LogEntry struct {
 	LogTerm  int
 	LogIndex int
 
-	LogCMD interface{}
+	LogCMD string
 }
 
 // Owl node
@@ -46,11 +54,24 @@ type Owl struct {
 	// my id
 	me int
 
+	// process channel
+	proposeC chan string
+
+	// leader id
+	leaderID int
+
 	// other nodes except me
 	nodes map[int]*node
 
+	// rpc client to other nodes
+	clientLock *sync.RWMutex
+	clients    map[int]*rpc.Client
+
 	// current state
 	state State
+
+	// current cluster health, has quorum or not
+	isHealthy bool
 
 	// current term
 	currentTerm int
@@ -77,8 +98,6 @@ type Owl struct {
 	// last applied(processed) log index
 	appliedLogIndex int
 
-	//lock *sync.RWMutex
-
 	// the main data which all the logEntries will be committed into
 	data OwlData
 
@@ -89,10 +108,14 @@ type Owl struct {
 	currentLogIndexMap map[int]int
 }
 
-func NewRaft(id int, port, address string) *Owl {
+func NewRaft(id int, port, address string, processChan chan string) *Owl {
 	raft := &Owl{
-		me:                 id,
-		nodes:              make(map[int]*node),
+		me:         id,
+		proposeC:   processChan,
+		nodes:      make(map[int]*node),
+		clients:    make(map[int]*rpc.Client),
+		clientLock: &sync.RWMutex{},
+
 		currentLogIndexMap: make(map[int]int),
 		heartbeatC:         make(chan bool),
 		toCandidateC:       make(chan bool),
@@ -105,6 +128,8 @@ func NewRaft(id int, port, address string) *Owl {
 	}
 
 	raft.rpc(port)
+
+	//go raft.clientHealthCheck()
 
 	raft.start()
 
@@ -135,14 +160,46 @@ func (rf *Owl) getLastLogIndex() int {
 }
 
 func (rf *Owl) getLastTerm() int {
-	//rf.lock.RLock()
-	//defer rf.lock.RUnlock()
 	return rf.currentTerm
+}
+
+func (rf *Owl) getClient(id int) (*rpc.Client, error) {
+	rf.clientLock.RLock()
+	client, ok := rf.clients[id]
+	rf.clientLock.RUnlock()
+	if ok && rf.sendHello(client) == nil {
+		return client, nil
+	}
+
+	client, err := rpc.DialHTTP("tcp", rf.nodes[id].address)
+	if err != nil {
+		glog.V(10).Infof("failed to dial %s with error %v", rf.nodes[id].address, err)
+		return nil, errRPCConnectFailed
+	}
+	rf.clientLock.Lock()
+	rf.clients[id] = client
+	rf.clientLock.Unlock()
+
+	return client, err
+}
+
+func (rf *Owl) newClient(id int) (*rpc.Client, error) {
+	rf.clientLock.Lock()
+	defer rf.clientLock.Unlock()
+	client, err := rpc.DialHTTP("tcp", rf.nodes[id].address)
+	if err != nil {
+		glog.V(10).Infof("failed to dial %s with error %v", rf.nodes[id].address, err)
+		return nil, errRPCConnectFailed
+	}
+	rf.clients[id] = client
+
+	return client, err
 }
 
 func (rf *Owl) start() {
 	rf.state = Follower
 	rf.currentTerm = 0
+	rf.leaderID = -1
 	rf.votedFor = -1
 	rf.heartbeatC = make(chan bool)
 	rf.toLeaderC = make(chan bool)
@@ -169,7 +226,8 @@ func (rf *Owl) step() {
 
 		case PreCandidate:
 			glog.V(4).Infof("follower-%d is a pre candidate, pre vote for myself, my term: %d", rf.me, rf.currentTerm)
-
+			rf.leaderID = -1
+			rf.votedFor = -1
 			rf.preVoteCount = 1
 			go rf.broadcastRequestVote(true)
 
@@ -193,7 +251,7 @@ func (rf *Owl) step() {
 			select {
 			case <-time.After(time.Duration(rand.Intn(5000-300)+300) * time.Millisecond):
 				glog.V(4).Infof("follower-%d requests vote timeout, Candidate => Follower", rf.me)
-				rf.state = Follower
+				rf.state = PreCandidate
 			case <-rf.toLeaderC:
 				glog.V(4).Infof("follower-%d wins the vote, Candidate => Leader", rf.me)
 
@@ -212,23 +270,31 @@ func (rf *Owl) step() {
 	}
 }
 
-func (rf *Owl) process(log *LogEntry, sync bool) error {
+func (rf *Owl) serveChannels() {
 	for {
-		switch rf.state {
-		case Follower:
-		case Candidate:
-			// Do nothing, waiting for the leader been elected
-		case Leader:
-			rf.appendLog(log)
-			if sync {
-				rf.waitingForCommitted(log)
+		select {
+		case msg := <-rf.proposeC:
+			switch rf.state {
+			case Follower:
+				rf.forwardDataToLeader(msg)
+			case Candidate:
+				// Do nothing, waiting for the leader been elected
+			case Leader:
+				glog.V(4).Infof("PROCESS %s", msg)
 			}
 		}
 	}
 }
 
-func (rf *Owl) forwardToLeader(log *LogEntry, sync bool) {
+func (rf *Owl) processData(msg string) error {
+	if rf.isHealthy {
+		rf.proposeC <- msg
+	}
+	return nil
+}
 
+func (rf *Owl) forwardDataToLeader(msg string) error {
+	return nil
 }
 
 func (rf *Owl) appendLog(log *LogEntry) {
@@ -244,26 +310,6 @@ func (rf *Owl) maybeSnapshot() {
 	}
 }
 
-func (rf *Owl) waitingForCommitted(log *LogEntry) {
-	ticker := time.NewTicker(1 * time.Second)
-	for {
-		select {
-		case <-ticker.C:
-		}
-	}
-}
-
-//
-//func (rf *Owl) LeaderProcessLog(log *LogEntry) error {
-//	//rf.toCommitLogs = append(rf.toCommitLogs, log)
-//
-//	for {
-//
-//	}
-//	rf.data.do(log)
-//	return nil
-//}
-
 type VoteArgs struct {
 	CurrentTerm       int
 	CommittedLogIndex int
@@ -271,10 +317,21 @@ type VoteArgs struct {
 	PreVote           bool
 }
 
+// VoteReason int
+type VoteReason int
+
+// MyTermHigher, MyCommittedLogIndexHigher, AlreadyVoted
+const (
+	MyTermHigher VoteReason = iota + 1
+	MyCommittedLogIndexHigher
+	AlreadyVoted
+)
+
 type VoteReply struct {
 	CurrentTerm       int
 	CommittedLogIndex int
 	VoteGranted       bool
+	Reason            VoteReason
 }
 
 func (rf *Owl) broadcastRequestVote(preVote bool) {
@@ -302,20 +359,16 @@ func (rf *Owl) broadcastRequestVote(preVote bool) {
 }
 
 func (rf *Owl) sendRequestVote(serverID int, args VoteArgs, reply *VoteReply) {
-	var (
-		address = rf.nodes[serverID].address
-	)
-	client, err := rpc.DialHTTP("tcp", address)
+	client, err := rf.getClient(serverID)
 	if err != nil {
-		glog.Errorf("failed to dial %s with error %v", address, err)
+		glog.V(10).Infof("failed to get rpc client to node %d with error %v", serverID, err)
 		return
 	}
-	defer client.Close()
 
-	glog.V(4).Infof("sendRequestVote %s, ARGS: %+v", address, args)
+	glog.V(4).Infof("sendRequestVote %d, ARGS: %+v", serverID, args)
 	err = client.Call("Owl.RequestVote", args, reply)
 	if err != nil {
-		glog.Errorf("failed to call %s with error %v", "Owl.RequestVote", err)
+		glog.V(10).Infof("failed to call %s with error %v", "Owl.RequestVote", err)
 		return
 	}
 	glog.V(4).Infof("REPLY: %+v, MY TERM: %d", reply, rf.currentTerm)
@@ -353,12 +406,14 @@ func (rf *Owl) RequestVote(args VoteArgs, reply *VoteReply) error {
 	// My term is higher, reject
 	if args.CurrentTerm < rf.currentTerm {
 		reply.VoteGranted = false
+		reply.Reason = MyTermHigher
 		return nil
 	}
 
 	// My last log index is higher, reject
 	if args.CommittedLogIndex < rf.getLastLogIndex() {
 		reply.VoteGranted = false
+		reply.Reason = MyCommittedLogIndexHigher
 		return nil
 	}
 
@@ -372,6 +427,7 @@ func (rf *Owl) RequestVote(args VoteArgs, reply *VoteReply) error {
 		return nil
 	}
 
+	reply.Reason = AlreadyVoted
 	reply.VoteGranted = false
 	return nil
 }
@@ -418,23 +474,19 @@ func (rf *Owl) broadcastHeartbeat() {
 }
 
 func (rf *Owl) sendHeartbeat(serverID int, args HeartbeatArgs, reply *HeartbeatReply) {
-	var (
-		address = rf.nodes[serverID].address
-	)
-	client, err := rpc.DialHTTP("tcp", address)
+	client, err := rf.getClient(serverID)
 	if err != nil {
-		glog.Errorf("failed to dial %s with error %v", address, err)
+		glog.V(10).Infof("failed to get rpc client to node %d with error %v", serverID, err)
 		return
 	}
-	defer client.Close()
 
-	glog.V(10).Infof("sendHeartbeat to %s, ARGS: %+v", address, args)
+	glog.V(10).Infof("sendHeartbeat to %d, ARGS: %+v", serverID, args)
 	err = client.Call("Owl.Heartbeat", args, &reply)
 	if err != nil {
-		glog.Errorf("failed to call %s with error %v", "Owl.Heartbeat", err)
+		glog.V(10).Infof("failed to call %s with error %v", "Owl.Heartbeat", err)
 		return
 	}
-	glog.V(10).Infof("sendHeartbeat REPLY from %s: REPLY: %+v", address, reply)
+	glog.V(10).Infof("sendHeartbeat REPLY from %d: REPLY: %+v", serverID, reply)
 
 	if reply.Success {
 		if reply.CurrentLogIndex > 0 {
@@ -466,6 +518,7 @@ func (rf *Owl) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
 		rf.votedFor = -1
 	}
 
+	rf.leaderID = args.LeaderID
 	rf.heartbeatC <- true
 
 	// Empty heartbeat, just tell leader our current log term
@@ -491,5 +544,86 @@ func (rf *Owl) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
 	reply.Term = rf.currentTerm
 	reply.CurrentLogIndex = rf.getLastLogIndex()
 
+	return nil
+}
+
+type DataArgs struct {
+	Data string
+}
+
+type DataReply struct {
+	Success bool
+}
+
+func (rf *Owl) clientHealthCheck() {
+	ticker := time.NewTicker(1 * time.Second)
+	for {
+		select {
+		case <-ticker.C:
+			for id := range rf.nodes {
+				var (
+					client *rpc.Client
+					err    error
+				)
+				client, err = rf.getClient(id)
+				if err != nil || rf.sendHello(client) != nil {
+					client, err = rf.newClient(id)
+				}
+			}
+		}
+	}
+}
+
+func (rf *Owl) sendHello(client *rpc.Client) error {
+	var (
+		args = &DataArgs{
+			Data: "hello",
+		}
+		reply = new(DataReply)
+	)
+	err := client.Call("Owl.Hello", args, reply)
+	if err != nil || !reply.Success {
+		glog.V(10).Infof("failed to call %s with error %v", "Owl.Hello", err)
+		return errRPCConnectFailed
+	}
+	return nil
+}
+
+func (rf *Owl) Hello(args DataArgs, reply *DataReply) error {
+	reply.Success = true
+	return nil
+}
+
+func (rf *Owl) sendData(msg string) error {
+	var (
+		args = &DataArgs{
+			Data: msg,
+		}
+		reply    = new(DataReply)
+		leaderID = rf.leaderID
+	)
+
+	if leaderID == -1 {
+		return errLeaderNotElected
+	}
+
+	client, err := rf.getClient(leaderID)
+	if err != nil {
+		glog.V(10).Infof("failed to get rpc client to node %d with error %v", leaderID, err)
+		return errRPCConnectFailed
+	}
+
+	err = client.Call("Owl.ReceiveData", args, reply)
+	if err != nil || !reply.Success {
+		glog.V(10).Infof("failed to call %s with error %v", "Owl.ReceiveData", err)
+		return errRPCConnectFailed
+	}
+	return nil
+}
+
+func (rf *Owl) ReceiveData(args DataArgs, reply *DataReply) error {
+	if rf.processData(args.Data) == nil {
+		reply.Success = true
+	}
 	return nil
 }
