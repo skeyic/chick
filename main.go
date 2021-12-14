@@ -21,8 +21,8 @@ func main() {
 	flag.Set("v", "4")
 
 	flag.Parse()
-	processC := make(chan string)
-	owluster.NewRaft(*id, *port, *cluster, processC)
+	beak := owluster.NewBeak()
+	owluster.NewRaft(*id, *port, *cluster, beak)
 
 	glog.V(4).Info("STARTED")
 

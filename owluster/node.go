@@ -14,8 +14,9 @@ import (
 
 // Errors ..
 var (
-	errRPCConnectFailed = errors.New("failed to connect through RPC")
-	errLeaderNotElected = errors.New("leader not elected")
+	errRPCConnectFailed  = errors.New("failed to connect through RPC")
+	errLeaderNotElected  = errors.New("leader not elected")
+	errClusterNotHealthy = errors.New("cluster not healthy")
 )
 
 // node cluster node
@@ -46,7 +47,109 @@ type LogEntry struct {
 	LogTerm  int
 	LogIndex int
 
-	LogCMD string
+	Msg string
+}
+
+type food struct {
+	msg    string
+	errorC chan error
+}
+
+func newFood(msg string) *food {
+	return &food{
+		msg:    msg,
+		errorC: make(chan error, 1),
+	}
+}
+
+type Beak struct {
+	proposeC chan *food
+}
+
+func NewBeak() *Beak {
+	return &Beak{proposeC: make(chan *food)}
+}
+
+func (b *Beak) Eat(msg string) {
+	b.proposeC <- newFood(msg)
+}
+
+func (b *Beak) Chew(msg string) error {
+	var (
+		f = newFood(msg)
+	)
+	b.proposeC <- f
+	for {
+		select {
+		case err := <-f.errorC:
+			return err
+		}
+	}
+}
+
+type Maw struct {
+	lock      *sync.RWMutex
+	logs      []*LogEntry
+	lastIndex int
+	lastTerm  int
+}
+
+func newMaw() *Maw {
+	return &Maw{
+		lock:      &sync.RWMutex{},
+		lastIndex: -1,
+		lastTerm:  -1,
+	}
+}
+
+func (m *Maw) len() int {
+	return len(m.logs)
+}
+
+func (m *Maw) getLastIndex() int {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	return m.lastIndex
+}
+
+func (m *Maw) getLastTerm() int {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	return m.lastTerm
+}
+
+func (m *Maw) getLogsSince(start int) []*LogEntry {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	return m.logs[start:]
+}
+
+func (m *Maw) addLog(term int, msg string) {
+	m.lock.Lock()
+	m.logs = append(m.logs,
+		&LogEntry{
+			LogTerm:  term,
+			LogIndex: len(m.logs),
+			Msg:      msg,
+		},
+	)
+	m.lastIndex++
+	m.lastTerm = term
+	m.lock.Unlock()
+}
+
+func (m *Maw) addLogs(logs []*LogEntry) {
+	m.lock.Lock()
+	m.logs = append(m.logs,
+		logs...,
+	)
+	m.lastTerm = logs[len(logs)-1].LogTerm
+	m.lastIndex = len(m.logs) - 1
+	m.lock.Unlock()
+}
+
+func (m *Maw) maybeSnapshot() {
+	// Remove committed maw from the maw if there are already too many there
 }
 
 // Owl node
@@ -55,7 +158,8 @@ type Owl struct {
 	me int
 
 	// process channel
-	proposeC chan string
+	proposeC chan *food
+	beak     *Beak
 
 	// leader id
 	leaderID int
@@ -101,17 +205,19 @@ type Owl struct {
 	// the main data which all the logEntries will be committed into
 	data OwlData
 
-	// the logs
-	logs []*LogEntry
+	// the maw
+	maw *Maw
 
 	// record the current log index from each node
 	currentLogIndexMap map[int]int
 }
 
-func NewRaft(id int, port, address string, processChan chan string) *Owl {
+func NewRaft(id int, port, address string, beak *Beak) *Owl {
 	raft := &Owl{
 		me:         id,
-		proposeC:   processChan,
+		beak:       beak,
+		proposeC:   beak.proposeC,
+		maw:        newMaw(),
 		nodes:      make(map[int]*node),
 		clients:    make(map[int]*rpc.Client),
 		clientLock: &sync.RWMutex{},
@@ -153,10 +259,7 @@ func (rf *Owl) rpc(port string) {
 }
 
 func (rf *Owl) getLastLogIndex() int {
-	if len(rf.logs) == 0 {
-		return 0
-	}
-	return rf.logs[len(rf.logs)-1].LogIndex
+	return rf.maw.getLastIndex()
 }
 
 func (rf *Owl) getLastTerm() int {
@@ -273,41 +376,29 @@ func (rf *Owl) step() {
 func (rf *Owl) serveChannels() {
 	for {
 		select {
-		case msg := <-rf.proposeC:
+		case food := <-rf.proposeC:
 			switch rf.state {
 			case Follower:
-				rf.forwardDataToLeader(msg)
-			case Candidate:
-				// Do nothing, waiting for the leader been elected
+				food.errorC <- rf.forwardDataToLeader(food.msg)
+			case PreCandidate, Candidate:
+				food.errorC <- errLeaderNotElected
 			case Leader:
-				glog.V(4).Infof("PROCESS %s", msg)
+				food.errorC <- rf.processData(food.msg)
 			}
 		}
 	}
 }
 
 func (rf *Owl) processData(msg string) error {
-	if rf.isHealthy {
-		rf.proposeC <- msg
+	if !rf.isHealthy {
+		return errClusterNotHealthy
 	}
+	rf.maw.addLog(rf.currentTerm, msg)
 	return nil
 }
 
 func (rf *Owl) forwardDataToLeader(msg string) error {
-	return nil
-}
-
-func (rf *Owl) appendLog(log *LogEntry) {
-	rf.maybeSnapshot()
-	rf.logs = append(rf.logs, log)
-	rf.committedLogIndex = rf.getLastLogIndex()
-}
-
-func (rf *Owl) maybeSnapshot() {
-	// Remove committed logs from the logs if there are already too many there
-	if len(rf.logs) > 100 {
-
-	}
+	return rf.sendDataToLeader(msg)
 }
 
 type VoteArgs struct {
@@ -460,8 +551,8 @@ func (rf *Owl) broadcastHeartbeat() {
 		prevLogIndex := rf.currentLogIndexMap[i]
 		if rf.getLastLogIndex() > prevLogIndex {
 			args.PrevLogIndex = prevLogIndex
-			args.PrevLogTerm = rf.logs[prevLogIndex].LogTerm
-			args.Logs = rf.logs[prevLogIndex:]
+			args.PrevLogTerm = rf.maw.getLastTerm()
+			args.Logs = rf.maw.getLogsSince(prevLogIndex)
 		}
 
 		go func(i int, args HeartbeatArgs) {
@@ -537,8 +628,8 @@ func (rf *Owl) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
 		return nil
 	}
 
-	// pre log index is correct, let's process the new logs and return the latest log term to leader
-	rf.logs = append(rf.logs, args.Logs...)
+	// pre log index is correct, let's process the new maw and return the latest log term to leader
+	rf.maw.addLogs(args.Logs)
 	rf.committedLogIndex = rf.getLastLogIndex()
 	reply.Success = true
 	reply.Term = rf.currentTerm
@@ -594,7 +685,7 @@ func (rf *Owl) Hello(args DataArgs, reply *DataReply) error {
 	return nil
 }
 
-func (rf *Owl) sendData(msg string) error {
+func (rf *Owl) sendDataToLeader(msg string) error {
 	var (
 		args = &DataArgs{
 			Data: msg,
