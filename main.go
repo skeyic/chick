@@ -7,24 +7,24 @@ import (
 )
 
 /*
-chick.exe --port :10111 --cluster 127.0.0.1:10222,127.0.0.1:10333 --id 1
-chick.exe --port :10222 --cluster 127.0.0.1:10111,127.0.0.1:10333 --id 2
-chick.exe --port :10333 --cluster 127.0.0.1:10111,127.0.0.1:10222 --id 3
+chick.exe --address 127.0.0.1:10111 --cluster 127.0.0.1:10111,127.0.0.1:10222,127.0.0.1:10333 --http_port :10112
+chick.exe --address 127.0.0.1:10222 --cluster 127.0.0.1:10111,127.0.0.1:10222,127.0.0.1:10333 --http_port :10223
+chick.exe --address 127.0.0.1:10333 --cluster 127.0.0.1:10111,127.0.0.1:10222,127.0.0.1:10333 --http_port :10334
 */
 
 func main() {
-	port := flag.String("port", ":9091", "rpc listen port")
-	cluster := flag.String("cluster", "127.0.0.1:9091", "comma sep")
-	id := flag.Int("id", 1, "node ID")
+	address := flag.String("address", "127.0.0.1:9091", "address in cluster")
+	cluster := flag.String("cluster", "127.0.0.1:9091,127.0.0.1:9093,127.0.0.1:9095", "comma sep")
+	httpport := flag.String("http_port", ":9092", "http listen port")
 
 	flag.Set("logtostderr", "true")
 	flag.Set("v", "4")
 
 	flag.Parse()
 	beak := owluster.NewBeak()
-	owluster.NewRaft(*id, *port, *cluster, beak)
+	owluster.NewOwl(*address, *cluster, beak)
+	owluster.ServeHttpKVAPI(*httpport, owluster.NewServer(beak))
 
 	glog.V(4).Info("STARTED")
-
 	<-make(chan struct{}, 1)
 }

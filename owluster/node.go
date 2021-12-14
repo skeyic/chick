@@ -67,7 +67,7 @@ type Beak struct {
 }
 
 func NewBeak() *Beak {
-	return &Beak{proposeC: make(chan *food)}
+	return &Beak{proposeC: make(chan *food, 100)}
 }
 
 func (b *Beak) Eat(msg string) {
@@ -148,6 +148,14 @@ func (m *Maw) addLogs(logs []*LogEntry) {
 	m.lock.Unlock()
 }
 
+func (m *Maw) report() {
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	for idx, value := range m.logs {
+		glog.V(4).Infof("IDX: %d, VALUE: %+v", idx, value)
+	}
+}
+
 func (m *Maw) maybeSnapshot() {
 	// Remove committed maw from the maw if there are already too many there
 }
@@ -155,21 +163,22 @@ func (m *Maw) maybeSnapshot() {
 // Owl node
 type Owl struct {
 	// my id
-	me int
+	me      string
+	address string
 
 	// process channel
 	proposeC chan *food
 	beak     *Beak
 
 	// leader id
-	leaderID int
+	leaderAddress string
 
 	// other nodes except me
-	nodes map[int]*node
+	nodes map[string]*node
 
 	// rpc client to other nodes
 	clientLock *sync.RWMutex
-	clients    map[int]*rpc.Client
+	clients    map[string]*rpc.Client
 
 	// current state
 	state State
@@ -180,15 +189,16 @@ type Owl struct {
 	// current term
 	currentTerm int
 
-	// vote for who in this term, -1 for nobody
-	votedFor int
+	// vote for who in this term, "" for nobody
+	votedFor string
 
 	// get voted count in this term
 	voteCount    int
 	preVoteCount int
 
 	// heartbeat channel
-	heartbeatC chan bool
+	heartbeatCount int
+	heartbeatC     chan bool
 
 	// to leader channel
 	toLeaderC chan bool
@@ -209,41 +219,44 @@ type Owl struct {
 	maw *Maw
 
 	// record the current log index from each node
-	currentLogIndexMap map[int]int
+	currentLogIndexMap map[string]int
 }
 
-func NewRaft(id int, port, address string, beak *Beak) *Owl {
-	raft := &Owl{
-		me:         id,
+func NewOwl(address, cluster string, beak *Beak) *Owl {
+	owl := &Owl{
+		me:         address,
 		beak:       beak,
 		proposeC:   beak.proposeC,
 		maw:        newMaw(),
-		nodes:      make(map[int]*node),
-		clients:    make(map[int]*rpc.Client),
+		nodes:      make(map[string]*node),
+		clients:    make(map[string]*rpc.Client),
 		clientLock: &sync.RWMutex{},
 
-		currentLogIndexMap: make(map[int]int),
+		currentLogIndexMap: make(map[string]int),
 		heartbeatC:         make(chan bool),
 		toCandidateC:       make(chan bool),
 		toLeaderC:          make(chan bool),
 	}
 
-	clusters := strings.Split(address, ",")
-	for k, v := range clusters {
-		raft.nodes[k] = &node{address: v}
+	clusters := strings.Split(cluster, ",")
+	for _, v := range clusters {
+		// Ignore myself
+		if v != address {
+			owl.nodes[v] = &node{address: v}
+		}
 	}
 
-	raft.rpc(port)
+	owl.rpc(address)
 
-	//go raft.clientHealthCheck()
+	//go owl.clientHealthCheck()
 
-	raft.start()
+	owl.start()
 
-	return raft
+	return owl
 }
 
-func (rf *Owl) rpc(port string) {
-	err := rpc.Register(rf)
+func (o *Owl) rpc(port string) {
+	err := rpc.Register(o)
 	if err != nil {
 		glog.Fatalf("failed to register rpc, error: %v", err)
 	}
@@ -258,153 +271,166 @@ func (rf *Owl) rpc(port string) {
 	go http.Serve(lis, nil)
 }
 
-func (rf *Owl) getLastLogIndex() int {
-	return rf.maw.getLastIndex()
+func (o *Owl) getLastLogIndex() int {
+	return o.maw.getLastIndex()
 }
 
-func (rf *Owl) getLastTerm() int {
-	return rf.currentTerm
+func (o *Owl) getLastTerm() int {
+	return o.currentTerm
 }
 
-func (rf *Owl) getClient(id int) (*rpc.Client, error) {
-	rf.clientLock.RLock()
-	client, ok := rf.clients[id]
-	rf.clientLock.RUnlock()
-	if ok && rf.sendHello(client) == nil {
+func (o *Owl) getClient(address string) (*rpc.Client, error) {
+	o.clientLock.RLock()
+	client, ok := o.clients[address]
+	o.clientLock.RUnlock()
+	if ok && o.sendHello(client) == nil {
 		return client, nil
 	}
 
-	client, err := rpc.DialHTTP("tcp", rf.nodes[id].address)
+	client, err := rpc.DialHTTP("tcp", o.nodes[address].address)
 	if err != nil {
-		glog.V(10).Infof("failed to dial %s with error %v", rf.nodes[id].address, err)
+		glog.V(10).Infof("failed to dial %s with error %v", o.nodes[address].address, err)
 		return nil, errRPCConnectFailed
 	}
-	rf.clientLock.Lock()
-	rf.clients[id] = client
-	rf.clientLock.Unlock()
+	o.clientLock.Lock()
+	o.clients[address] = client
+	o.clientLock.Unlock()
 
 	return client, err
 }
 
-func (rf *Owl) newClient(id int) (*rpc.Client, error) {
-	rf.clientLock.Lock()
-	defer rf.clientLock.Unlock()
-	client, err := rpc.DialHTTP("tcp", rf.nodes[id].address)
+func (o *Owl) newClient(address string) (*rpc.Client, error) {
+	o.clientLock.Lock()
+	defer o.clientLock.Unlock()
+	client, err := rpc.DialHTTP("tcp", o.nodes[address].address)
 	if err != nil {
-		glog.V(10).Infof("failed to dial %s with error %v", rf.nodes[id].address, err)
+		glog.V(10).Infof("failed to dial %s with error %v", o.nodes[address].address, err)
 		return nil, errRPCConnectFailed
 	}
-	rf.clients[id] = client
+	o.clients[address] = client
 
 	return client, err
 }
 
-func (rf *Owl) start() {
-	rf.state = Follower
-	rf.currentTerm = 0
-	rf.leaderID = -1
-	rf.votedFor = -1
-	rf.heartbeatC = make(chan bool)
-	rf.toLeaderC = make(chan bool)
+func (o *Owl) start() {
+	o.state = Follower
+	o.currentTerm = 0
+	o.leaderAddress = ""
+	o.votedFor = ""
+	o.heartbeatC = make(chan bool)
+	o.toLeaderC = make(chan bool)
 
 	// state change and handle RPC
-	go rf.step()
+	go o.step()
+	go o.serveChannels()
+	go o.debug()
 }
 
-func (rf *Owl) step() {
+func (o *Owl) step() {
 	rand.Seed(time.Now().UnixNano())
 
 	for {
-		switch rf.state {
+		switch o.state {
 		case Follower:
-			glog.V(10).Infof("follower-%d is a follower", rf.me)
+			glog.V(10).Infof("follower-%s is a follower", o.me)
 			select {
-			case <-rf.heartbeatC:
-				glog.V(10).Infof("follower-%d receives heartbeat", rf.me)
+			case <-o.heartbeatC:
+				glog.V(10).Infof("follower-%s receives heartbeat", o.me)
 
 			case <-time.After(time.Duration(rand.Intn(500-300)+300) * time.Millisecond):
-				glog.V(4).Infof("follower-%d receives heartbeat timeout, Follower => PreCandidate", rf.me)
-				rf.state = PreCandidate
+				glog.V(4).Infof("follower-%s receives heartbeat timeout, Follower => PreCandidate", o.me)
+				o.state = PreCandidate
 			}
 
 		case PreCandidate:
-			glog.V(4).Infof("follower-%d is a pre candidate, pre vote for myself, my term: %d", rf.me, rf.currentTerm)
-			rf.leaderID = -1
-			rf.votedFor = -1
-			rf.preVoteCount = 1
-			go rf.broadcastRequestVote(true)
+			glog.V(4).Infof("follower-%s is a pre candidate, pre vote for myself, my term: %d", o.me, o.currentTerm)
+			o.leaderAddress = ""
+			o.votedFor = ""
+			o.preVoteCount = 1
+			go o.broadcastRequestVote(true)
 
 			select {
 			case <-time.After(time.Duration(rand.Intn(5000-300)+300) * time.Millisecond):
-				glog.V(4).Infof("follower-%d requests pre vote timeout, PreCandidate => Follower", rf.me)
-				rf.state = Follower
-			case <-rf.toCandidateC:
-				glog.V(4).Infof("follower-%d wins the pre vote, PreCandidate => Candidate", rf.me)
-				rf.state = Candidate
+				glog.V(4).Infof("follower-%s requests pre vote timeout, PreCandidate => Follower", o.me)
+				o.state = Follower
+			case <-o.toCandidateC:
+				glog.V(4).Infof("follower-%s wins the pre vote, PreCandidate => Candidate", o.me)
+				o.state = Candidate
 			}
 
 		case Candidate:
-			rf.currentTerm++
-			rf.votedFor = rf.me
-			rf.voteCount = 1
-			glog.V(4).Infof("follower-%d is a candidate, vote for myself, my term: %d", rf.me, rf.currentTerm)
+			o.currentTerm++
+			o.votedFor = o.address
+			o.voteCount = 1
+			glog.V(4).Infof("follower-%s is a candidate, vote for myself, my term: %d", o.me, o.currentTerm)
 
-			go rf.broadcastRequestVote(false)
+			go o.broadcastRequestVote(false)
 
 			select {
 			case <-time.After(time.Duration(rand.Intn(5000-300)+300) * time.Millisecond):
-				glog.V(4).Infof("follower-%d requests vote timeout, Candidate => Follower", rf.me)
-				rf.state = PreCandidate
-			case <-rf.toLeaderC:
-				glog.V(4).Infof("follower-%d wins the vote, Candidate => Leader", rf.me)
+				glog.V(4).Infof("follower-%s requests vote timeout, Candidate => Follower", o.me)
+				o.state = PreCandidate
+			case <-o.toLeaderC:
+				glog.V(4).Infof("follower-%s wins the vote, Candidate => Leader", o.me)
 
-				for i := range rf.nodes {
-					rf.currentLogIndexMap[i] = 0
+				for _, i := range o.nodes {
+					o.currentLogIndexMap[i.address] = 0
 				}
 
-				rf.state = Leader
+				o.state = Leader
 			}
 
 		case Leader:
-			glog.V(10).Infof("follower-%d is a leader, send heartbeat", rf.me)
-			rf.broadcastHeartbeat()
+			glog.V(10).Infof("follower-%s is a leader, send heartbeat", o.me)
+			o.broadcastHeartbeat()
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
 
-func (rf *Owl) serveChannels() {
+func (o *Owl) serveChannels() {
 	for {
 		select {
-		case food := <-rf.proposeC:
-			switch rf.state {
+		case food := <-o.beak.proposeC:
+			glog.V(4).Infof("ROLE: %d, FOOD: %+v", o.state, food)
+			switch o.state {
 			case Follower:
-				food.errorC <- rf.forwardDataToLeader(food.msg)
+				food.errorC <- o.forwardDataToLeader(food.msg)
 			case PreCandidate, Candidate:
 				food.errorC <- errLeaderNotElected
 			case Leader:
-				food.errorC <- rf.processData(food.msg)
+				food.errorC <- o.processData(food.msg)
 			}
 		}
 	}
 }
 
-func (rf *Owl) processData(msg string) error {
-	if !rf.isHealthy {
+func (o *Owl) debug() {
+	ticker := time.NewTicker(10 * time.Second)
+	for {
+		select {
+		case <-ticker.C:
+			o.maw.report()
+		}
+	}
+}
+
+func (o *Owl) processData(msg string) error {
+	if !o.isHealthy {
 		return errClusterNotHealthy
 	}
-	rf.maw.addLog(rf.currentTerm, msg)
+	o.maw.addLog(o.currentTerm, msg)
 	return nil
 }
 
-func (rf *Owl) forwardDataToLeader(msg string) error {
-	return rf.sendDataToLeader(msg)
+func (o *Owl) forwardDataToLeader(msg string) error {
+	return o.sendDataToLeader(msg)
 }
 
 type VoteArgs struct {
 	CurrentTerm       int
 	CommittedLogIndex int
-	CandidateID       int
+	CandidateID       string
 	PreVote           bool
 }
 
@@ -425,12 +451,12 @@ type VoteReply struct {
 	Reason            VoteReason
 }
 
-func (rf *Owl) broadcastRequestVote(preVote bool) {
+func (o *Owl) broadcastRequestVote(preVote bool) {
 	var (
 		args = VoteArgs{
-			CurrentTerm:       rf.currentTerm,
-			CommittedLogIndex: rf.committedLogIndex,
-			CandidateID:       rf.me,
+			CurrentTerm:       o.currentTerm,
+			CommittedLogIndex: o.committedLogIndex,
+			CandidateID:       o.me,
 			PreVote:           preVote,
 		}
 	)
@@ -439,79 +465,79 @@ func (rf *Owl) broadcastRequestVote(preVote bool) {
 		args.CurrentTerm++
 	}
 
-	for i := range rf.nodes {
-		go func(i int) {
+	for _, i := range o.nodes {
+		go func(i string) {
 			var (
 				reply = new(VoteReply)
 			)
-			rf.sendRequestVote(i, args, reply)
-		}(i)
+			o.sendRequestVote(i, args, reply)
+		}(i.address)
 	}
 }
 
-func (rf *Owl) sendRequestVote(serverID int, args VoteArgs, reply *VoteReply) {
-	client, err := rf.getClient(serverID)
+func (o *Owl) sendRequestVote(serverAddress string, args VoteArgs, reply *VoteReply) {
+	client, err := o.getClient(serverAddress)
 	if err != nil {
-		glog.V(10).Infof("failed to get rpc client to node %d with error %v", serverID, err)
+		glog.V(10).Infof("failed to get rpc client to node %s with error %v", serverAddress, err)
 		return
 	}
 
-	glog.V(4).Infof("sendRequestVote %d, ARGS: %+v", serverID, args)
+	glog.V(4).Infof("sendRequestVote %s, ARGS: %+v", serverAddress, args)
 	err = client.Call("Owl.RequestVote", args, reply)
 	if err != nil {
 		glog.V(10).Infof("failed to call %s with error %v", "Owl.RequestVote", err)
 		return
 	}
-	glog.V(4).Infof("REPLY: %+v, MY TERM: %d", reply, rf.currentTerm)
+	glog.V(4).Infof("REPLY: %+v, MY TERM: %d", reply, o.currentTerm)
 
 	if args.PreVote {
 		if reply.VoteGranted {
-			rf.preVoteCount++
+			o.preVoteCount++
 
-			if rf.preVoteCount >= len(rf.nodes)/2+1 {
-				rf.toCandidateC <- true
+			if o.preVoteCount >= len(o.nodes)/2+1 {
+				o.toCandidateC <- true
 			}
 		}
 	} else {
-		if reply.CurrentTerm > rf.currentTerm {
-			rf.currentTerm = reply.CurrentTerm
-			rf.state = Follower
-			rf.votedFor = -1
+		if reply.CurrentTerm > o.currentTerm {
+			o.currentTerm = reply.CurrentTerm
+			o.state = Follower
+			o.votedFor = ""
 			return
 		}
 
 		if reply.VoteGranted {
-			rf.voteCount++
+			o.voteCount++
 
-			if rf.voteCount >= len(rf.nodes)/2+1 {
-				rf.toLeaderC <- true
+			if o.voteCount >= len(o.nodes)/2+1 {
+				o.toLeaderC <- true
 			}
 		}
 	}
 }
 
-func (rf *Owl) RequestVote(args VoteArgs, reply *VoteReply) error {
-	reply.CurrentTerm = rf.currentTerm
-	reply.CommittedLogIndex = rf.getLastLogIndex()
+func (o *Owl) RequestVote(args VoteArgs, reply *VoteReply) error {
+	reply.CurrentTerm = o.currentTerm
+	reply.CommittedLogIndex = o.getLastLogIndex()
 
 	// My term is higher, reject
-	if args.CurrentTerm < rf.currentTerm {
+	if args.CurrentTerm < o.currentTerm {
 		reply.VoteGranted = false
 		reply.Reason = MyTermHigher
 		return nil
 	}
 
 	// My last log index is higher, reject
-	if args.CommittedLogIndex < rf.getLastLogIndex() {
+	if args.CommittedLogIndex < o.getLastLogIndex() {
 		reply.VoteGranted = false
 		reply.Reason = MyCommittedLogIndexHigher
 		return nil
 	}
 
-	if rf.votedFor == -1 {
+	if o.votedFor == "" {
 		if !args.PreVote {
-			rf.currentTerm = args.CurrentTerm
-			rf.votedFor = args.CandidateID
+			o.currentTerm = args.CurrentTerm
+			o.votedFor = args.CandidateID
 		}
 
 		reply.VoteGranted = true
@@ -524,8 +550,8 @@ func (rf *Owl) RequestVote(args VoteArgs, reply *VoteReply) error {
 }
 
 type HeartbeatArgs struct {
-	Term     int
-	LeaderID int
+	Term          int
+	LeaderAddress string
 
 	CurrentLogTerm int
 	Logs           []*LogEntry
@@ -539,101 +565,108 @@ type HeartbeatReply struct {
 	CurrentLogIndex int
 }
 
-func (rf *Owl) broadcastHeartbeat() {
-	for i := range rf.nodes {
+func (o *Owl) broadcastHeartbeat() {
+	o.heartbeatCount = 1
+	o.isHealthy = false
+
+	for _, i := range o.nodes {
 		var (
 			args = HeartbeatArgs{
-				Term:     rf.currentTerm,
-				LeaderID: rf.me,
+				Term:          o.currentTerm,
+				LeaderAddress: o.me,
 			}
 		)
 
-		prevLogIndex := rf.currentLogIndexMap[i]
-		if rf.getLastLogIndex() > prevLogIndex {
+		prevLogIndex := o.currentLogIndexMap[i.address]
+		if o.getLastLogIndex() > prevLogIndex {
 			args.PrevLogIndex = prevLogIndex
-			args.PrevLogTerm = rf.maw.getLastTerm()
-			args.Logs = rf.maw.getLogsSince(prevLogIndex)
+			args.PrevLogTerm = o.maw.getLastTerm()
+			args.Logs = o.maw.getLogsSince(prevLogIndex)
 		}
 
-		go func(i int, args HeartbeatArgs) {
+		go func(i string, args HeartbeatArgs) {
 			var (
 				reply = new(HeartbeatReply)
 			)
-			rf.sendHeartbeat(i, args, reply)
-		}(i, args)
+			o.sendHeartbeat(i, args, reply)
+		}(i.address, args)
 	}
 }
 
-func (rf *Owl) sendHeartbeat(serverID int, args HeartbeatArgs, reply *HeartbeatReply) {
-	client, err := rf.getClient(serverID)
+func (o *Owl) sendHeartbeat(serverAddress string, args HeartbeatArgs, reply *HeartbeatReply) {
+	client, err := o.getClient(serverAddress)
 	if err != nil {
-		glog.V(10).Infof("failed to get rpc client to node %d with error %v", serverID, err)
+		glog.V(10).Infof("failed to get rpc client to node %s with error %v", serverAddress, err)
 		return
 	}
 
-	glog.V(10).Infof("sendHeartbeat to %d, ARGS: %+v", serverID, args)
+	glog.V(10).Infof("sendHeartbeat to %s, ARGS: %+v", serverAddress, args)
 	err = client.Call("Owl.Heartbeat", args, &reply)
 	if err != nil {
 		glog.V(10).Infof("failed to call %s with error %v", "Owl.Heartbeat", err)
 		return
 	}
-	glog.V(10).Infof("sendHeartbeat REPLY from %d: REPLY: %+v", serverID, reply)
+	glog.V(10).Infof("sendHeartbeat REPLY from %s: REPLY: %+v", serverAddress, reply)
 
 	if reply.Success {
 		if reply.CurrentLogIndex > 0 {
-			rf.currentLogIndexMap[serverID] = reply.CurrentLogIndex
+			o.currentLogIndexMap[serverAddress] = reply.CurrentLogIndex
+		}
+		o.heartbeatCount++
+		if o.heartbeatCount > len(o.nodes)/2+1 {
+			o.isHealthy = true
 		}
 	} else {
 		// TWO CASES:
 		// 1. its term is higher than mine, we need to become the follower
 		// 2. the prev log index is not correct, do nothing, next time heartbeat we will send using the correct index
-		if reply.Term > rf.currentTerm {
-			rf.currentTerm = reply.Term
-			rf.state = Follower
-			rf.votedFor = -1
+		if reply.Term > o.currentTerm {
+			o.currentTerm = reply.Term
+			o.state = Follower
+			o.votedFor = ""
 		}
 	}
 }
 
-func (rf *Owl) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
+func (o *Owl) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
 	// My term is higher
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
+	if args.Term < o.currentTerm {
+		reply.Term = o.currentTerm
 		return nil
 	}
 
 	// Leader's term is higher
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.state = Follower
-		rf.votedFor = -1
+	if args.Term > o.currentTerm {
+		o.currentTerm = args.Term
+		o.state = Follower
+		o.votedFor = ""
 	}
 
-	rf.leaderID = args.LeaderID
-	rf.heartbeatC <- true
+	o.leaderAddress = args.LeaderAddress
+	o.heartbeatC <- true
 
 	// Empty heartbeat, just tell leader our current log term
 	if len(args.Logs) == 0 {
 		reply.Success = true
-		reply.Term = rf.currentTerm
-		reply.CurrentLogIndex = rf.getLastLogIndex()
+		reply.Term = o.currentTerm
+		reply.CurrentLogIndex = o.getLastLogIndex()
 		return nil
 	}
 
 	// If the pre log index is not match, do nothing but tell leader our current log term
-	if args.PrevLogIndex > rf.getLastLogIndex() {
+	if args.PrevLogIndex > o.getLastLogIndex() {
 		reply.Success = false
-		reply.Term = rf.currentTerm
-		reply.CurrentLogIndex = rf.getLastLogIndex()
+		reply.Term = o.currentTerm
+		reply.CurrentLogIndex = o.getLastLogIndex()
 		return nil
 	}
 
 	// pre log index is correct, let's process the new maw and return the latest log term to leader
-	rf.maw.addLogs(args.Logs)
-	rf.committedLogIndex = rf.getLastLogIndex()
+	o.maw.addLogs(args.Logs)
+	o.committedLogIndex = o.getLastLogIndex()
 	reply.Success = true
-	reply.Term = rf.currentTerm
-	reply.CurrentLogIndex = rf.getLastLogIndex()
+	reply.Term = o.currentTerm
+	reply.CurrentLogIndex = o.getLastLogIndex()
 
 	return nil
 }
@@ -646,26 +679,26 @@ type DataReply struct {
 	Success bool
 }
 
-func (rf *Owl) clientHealthCheck() {
+func (o *Owl) clientHealthCheck() {
 	ticker := time.NewTicker(1 * time.Second)
 	for {
 		select {
 		case <-ticker.C:
-			for id := range rf.nodes {
+			for id := range o.nodes {
 				var (
 					client *rpc.Client
 					err    error
 				)
-				client, err = rf.getClient(id)
-				if err != nil || rf.sendHello(client) != nil {
-					client, err = rf.newClient(id)
+				client, err = o.getClient(id)
+				if err != nil || o.sendHello(client) != nil {
+					client, err = o.newClient(id)
 				}
 			}
 		}
 	}
 }
 
-func (rf *Owl) sendHello(client *rpc.Client) error {
+func (o *Owl) sendHello(client *rpc.Client) error {
 	var (
 		args = &DataArgs{
 			Data: "hello",
@@ -680,27 +713,27 @@ func (rf *Owl) sendHello(client *rpc.Client) error {
 	return nil
 }
 
-func (rf *Owl) Hello(args DataArgs, reply *DataReply) error {
+func (o *Owl) Hello(args DataArgs, reply *DataReply) error {
 	reply.Success = true
 	return nil
 }
 
-func (rf *Owl) sendDataToLeader(msg string) error {
+func (o *Owl) sendDataToLeader(msg string) error {
 	var (
 		args = &DataArgs{
 			Data: msg,
 		}
 		reply    = new(DataReply)
-		leaderID = rf.leaderID
+		leaderID = o.leaderAddress
 	)
 
-	if leaderID == -1 {
+	if leaderID == "" {
 		return errLeaderNotElected
 	}
 
-	client, err := rf.getClient(leaderID)
+	client, err := o.getClient(leaderID)
 	if err != nil {
-		glog.V(10).Infof("failed to get rpc client to node %d with error %v", leaderID, err)
+		glog.V(10).Infof("failed to get rpc client to node %s with error %v", leaderID, err)
 		return errRPCConnectFailed
 	}
 
@@ -712,8 +745,8 @@ func (rf *Owl) sendDataToLeader(msg string) error {
 	return nil
 }
 
-func (rf *Owl) ReceiveData(args DataArgs, reply *DataReply) error {
-	if rf.processData(args.Data) == nil {
+func (o *Owl) ReceiveData(args DataArgs, reply *DataReply) error {
+	if o.processData(args.Data) == nil {
 		reply.Success = true
 	}
 	return nil
