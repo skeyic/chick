@@ -121,7 +121,10 @@ func (m *Maw) getLastTerm() int {
 func (m *Maw) getLogsSince(start int) []*LogEntry {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
-	return m.logs[start:]
+	//if start == -1 {
+	//	return m.logs
+	//}
+	return m.logs[start+1:]
 }
 
 func (m *Maw) addLog(term int, msg string) {
@@ -151,6 +154,7 @@ func (m *Maw) addLogs(logs []*LogEntry) {
 func (m *Maw) report() {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
+	glog.V(4).Infof("==================REPORT==================")
 	for idx, value := range m.logs {
 		glog.V(4).Infof("IDX: %d, VALUE: %+v", idx, value)
 	}
@@ -158,6 +162,54 @@ func (m *Maw) report() {
 
 func (m *Maw) maybeSnapshot() {
 	// Remove committed maw from the maw if there are already too many there
+}
+
+const healthCheckGap = 3
+
+type healthChecker struct {
+	lock    *sync.RWMutex
+	idx     int
+	lastIdx int
+	count   int
+	nodes   map[string]int
+}
+
+func newHealthChecker() *healthChecker {
+	return &healthChecker{
+		lock:    &sync.RWMutex{},
+		idx:     -1,
+		lastIdx: -1,
+		nodes:   make(map[string]int),
+	}
+}
+
+func (h *healthChecker) start() int {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	h.idx++
+	h.count = 1 // we have myself
+	return h.idx
+}
+
+func (h *healthChecker) Add(address string, idx int) {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+
+	h.nodes[address] = idx
+	if idx == h.idx {
+		h.count++
+		if h.count >= len(h.nodes)/2+1 {
+			h.lastIdx = h.idx
+		}
+	}
+}
+
+func (h *healthChecker) isHealthy() bool {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	glog.V(4).Infof("IDX: %d, LAST: %d, HEALTHY: %v", h.idx, h.lastIdx, h.idx-h.lastIdx < healthCheckGap)
+	glog.V(4).Infof("IDXs: %+v", h.nodes)
+	return h.idx-h.lastIdx < healthCheckGap
 }
 
 // Owl node
@@ -184,12 +236,13 @@ type Owl struct {
 	state State
 
 	// current cluster health, has quorum or not
-	isHealthy bool
+	healthChecker *healthChecker
 
 	// current term
 	currentTerm int
 
 	// vote for who in this term, "" for nobody
+	voteLock *sync.RWMutex
 	votedFor string
 
 	// get voted count in this term
@@ -219,20 +272,23 @@ type Owl struct {
 	maw *Maw
 
 	// record the current log index from each node
-	currentLogIndexMap map[string]int
+	clusterLock        *sync.RWMutex
+	clusterLogIndexMap map[string]int
 }
 
 func NewOwl(address, cluster string, beak *Beak) *Owl {
 	owl := &Owl{
-		me:         address,
-		beak:       beak,
-		proposeC:   beak.proposeC,
-		maw:        newMaw(),
-		nodes:      make(map[string]*node),
-		clients:    make(map[string]*rpc.Client),
-		clientLock: &sync.RWMutex{},
-
-		currentLogIndexMap: make(map[string]int),
+		me:                 address,
+		beak:               beak,
+		proposeC:           beak.proposeC,
+		maw:                newMaw(),
+		nodes:              make(map[string]*node),
+		clients:            make(map[string]*rpc.Client),
+		clientLock:         &sync.RWMutex{},
+		voteLock:           &sync.RWMutex{},
+		clusterLock:        &sync.RWMutex{},
+		clusterLogIndexMap: make(map[string]int),
+		healthChecker:      newHealthChecker(),
 		heartbeatC:         make(chan bool),
 		toCandidateC:       make(chan bool),
 		toLeaderC:          make(chan bool),
@@ -243,6 +299,7 @@ func NewOwl(address, cluster string, beak *Beak) *Owl {
 		// Ignore myself
 		if v != address {
 			owl.nodes[v] = &node{address: v}
+			owl.healthChecker.nodes[v] = -1
 		}
 	}
 
@@ -312,6 +369,22 @@ func (o *Owl) newClient(address string) (*rpc.Client, error) {
 	return client, err
 }
 
+func (o *Owl) getVoteFor() string {
+	o.voteLock.RLock()
+	defer o.voteLock.RUnlock()
+	return o.votedFor
+}
+
+func (o *Owl) setVoteFor(target string) {
+	o.voteLock.Lock()
+	o.votedFor = target
+	o.voteLock.Unlock()
+}
+
+func (o *Owl) isHealthy() bool {
+	return o.healthChecker.isHealthy()
+}
+
 func (o *Owl) start() {
 	o.state = Follower
 	o.currentTerm = 0
@@ -345,7 +418,7 @@ func (o *Owl) step() {
 		case PreCandidate:
 			glog.V(4).Infof("follower-%s is a pre candidate, pre vote for myself, my term: %d", o.me, o.currentTerm)
 			o.leaderAddress = ""
-			o.votedFor = ""
+			o.setVoteFor("")
 			o.preVoteCount = 1
 			go o.broadcastRequestVote(true)
 
@@ -360,7 +433,7 @@ func (o *Owl) step() {
 
 		case Candidate:
 			o.currentTerm++
-			o.votedFor = o.address
+			o.setVoteFor(o.address)
 			o.voteCount = 1
 			glog.V(4).Infof("follower-%s is a candidate, vote for myself, my term: %d", o.me, o.currentTerm)
 
@@ -373,9 +446,11 @@ func (o *Owl) step() {
 			case <-o.toLeaderC:
 				glog.V(4).Infof("follower-%s wins the vote, Candidate => Leader", o.me)
 
+				o.clusterLock.Lock()
 				for _, i := range o.nodes {
-					o.currentLogIndexMap[i.address] = 0
+					o.clusterLogIndexMap[i.address] = -1
 				}
+				o.clusterLock.Unlock()
 
 				o.state = Leader
 			}
@@ -416,7 +491,7 @@ func (o *Owl) debug() {
 }
 
 func (o *Owl) processData(msg string) error {
-	if !o.isHealthy {
+	if !o.isHealthy() {
 		return errClusterNotHealthy
 	}
 	o.maw.addLog(o.currentTerm, msg)
@@ -534,10 +609,10 @@ func (o *Owl) RequestVote(args VoteArgs, reply *VoteReply) error {
 		return nil
 	}
 
-	if o.votedFor == "" {
+	if o.getVoteFor() == "" {
 		if !args.PreVote {
 			o.currentTerm = args.CurrentTerm
-			o.votedFor = args.CandidateID
+			o.setVoteFor(args.CandidateID)
 		}
 
 		reply.VoteGranted = true
@@ -550,8 +625,9 @@ func (o *Owl) RequestVote(args VoteArgs, reply *VoteReply) error {
 }
 
 type HeartbeatArgs struct {
-	Term          int
-	LeaderAddress string
+	Idx  int
+	Term int
+	Me   string
 
 	CurrentLogTerm int
 	Logs           []*LogEntry
@@ -560,24 +636,31 @@ type HeartbeatArgs struct {
 }
 
 type HeartbeatReply struct {
+	Me              string
+	Idx             int
 	Term            int
 	Success         bool
 	CurrentLogIndex int
 }
 
 func (o *Owl) broadcastHeartbeat() {
-	o.heartbeatCount = 1
-	o.isHealthy = false
+	idx := o.healthChecker.start()
 
 	for _, i := range o.nodes {
 		var (
 			args = HeartbeatArgs{
-				Term:          o.currentTerm,
-				LeaderAddress: o.me,
+				Idx:            idx,
+				Term:           o.currentTerm,
+				Me:             o.me,
+				CurrentLogTerm: o.getLastTerm(),
 			}
 		)
 
-		prevLogIndex := o.currentLogIndexMap[i.address]
+		o.clusterLock.RLock()
+		prevLogIndex := o.clusterLogIndexMap[i.address]
+		o.clusterLock.RUnlock()
+		//glog.V(4).Infof("NODE: %v, PREVLOGINDEX: %d, LASTLOGINDEX: %d",
+		//	i, o.getLastLogIndex(), prevLogIndex)
 		if o.getLastLogIndex() > prevLogIndex {
 			args.PrevLogIndex = prevLogIndex
 			args.PrevLogTerm = o.maw.getLastTerm()
@@ -603,20 +686,19 @@ func (o *Owl) sendHeartbeat(serverAddress string, args HeartbeatArgs, reply *Hea
 	glog.V(10).Infof("sendHeartbeat to %s, ARGS: %+v", serverAddress, args)
 	err = client.Call("Owl.Heartbeat", args, &reply)
 	if err != nil {
-		glog.V(10).Infof("failed to call %s with error %v", "Owl.Heartbeat", err)
+		glog.V(4).Infof("failed to call %s with error %v", "Owl.Heartbeat", err)
 		return
 	}
-	glog.V(10).Infof("sendHeartbeat REPLY from %s: REPLY: %+v", serverAddress, reply)
 
 	if reply.Success {
-		if reply.CurrentLogIndex > 0 {
-			o.currentLogIndexMap[serverAddress] = reply.CurrentLogIndex
+		if reply.CurrentLogIndex >= -1 {
+			o.clusterLock.Lock()
+			o.clusterLogIndexMap[serverAddress] = reply.CurrentLogIndex
+			o.clusterLock.Unlock()
 		}
-		o.heartbeatCount++
-		if o.heartbeatCount > len(o.nodes)/2+1 {
-			o.isHealthy = true
-		}
+		o.healthChecker.Add(reply.Me, reply.Idx)
 	} else {
+		glog.V(4).Infof("sendHeartbeat REPLY from %s: ARGS: %+v, REPLY: %+v", serverAddress, args, reply)
 		// TWO CASES:
 		// 1. its term is higher than mine, we need to become the follower
 		// 2. the prev log index is not correct, do nothing, next time heartbeat we will send using the correct index
@@ -629,6 +711,9 @@ func (o *Owl) sendHeartbeat(serverAddress string, args HeartbeatArgs, reply *Hea
 }
 
 func (o *Owl) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
+	reply.Me = o.me
+	reply.Idx = args.Idx
+
 	// My term is higher
 	if args.Term < o.currentTerm {
 		reply.Term = o.currentTerm
@@ -639,10 +724,10 @@ func (o *Owl) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
 	if args.Term > o.currentTerm {
 		o.currentTerm = args.Term
 		o.state = Follower
-		o.votedFor = ""
+		o.setVoteFor("")
 	}
 
-	o.leaderAddress = args.LeaderAddress
+	o.leaderAddress = args.Me
 	o.heartbeatC <- true
 
 	// Empty heartbeat, just tell leader our current log term
@@ -653,17 +738,17 @@ func (o *Owl) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
 		return nil
 	}
 
-	// If the pre log index is not match, do nothing but tell leader our current log term
-	if args.PrevLogIndex > o.getLastLogIndex() {
-		reply.Success = false
-		reply.Term = o.currentTerm
-		reply.CurrentLogIndex = o.getLastLogIndex()
-		return nil
-	}
+	//sendHeartbeat REPLY from 127.0.0.1:10333:
+	//ARGS: {Idx:1238 Term:1 Me:127.0.0.1:10111 CurrentLogTerm:0 Logs:[0xc000044cc0 0xc0002a4580] PrevLogIndex:0 PrevLogTerm:1},
+	//REPLY: &{Me:127.0.0.1:10333 Idx:1238 Term:1 Success:false CurrentLogIndex:-1}
 
 	// pre log index is correct, let's process the new maw and return the latest log term to leader
-	o.maw.addLogs(args.Logs)
-	o.committedLogIndex = o.getLastLogIndex()
+	// otherwise the pre log index is not match, do nothing but tell leader our current log term
+	if args.PrevLogIndex == o.getLastLogIndex() {
+		o.maw.addLogs(args.Logs)
+		o.committedLogIndex = o.getLastLogIndex()
+	}
+
 	reply.Success = true
 	reply.Term = o.currentTerm
 	reply.CurrentLogIndex = o.getLastLogIndex()
@@ -738,8 +823,9 @@ func (o *Owl) sendDataToLeader(msg string) error {
 	}
 
 	err = client.Call("Owl.ReceiveData", args, reply)
+	glog.V(4).Infof("ARGS: %+v, REPLY: %+v", args, reply)
 	if err != nil || !reply.Success {
-		glog.V(10).Infof("failed to call %s with error %v", "Owl.ReceiveData", err)
+		glog.Errorf("failed to call %s with error %v", "Owl.ReceiveData", err)
 		return errRPCConnectFailed
 	}
 	return nil
