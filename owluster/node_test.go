@@ -31,7 +31,7 @@ func TestRPCClient2(t *testing.T) {
 		log.Fatal("dialing:", err)
 	}
 
-	args := &VoteArgs{999, 1, 1, false}
+	args := &VoteArgs{999, 1, "127.0.0.1:9001", false}
 	var reply = new(VoteReply)
 	err = client.Call("Owl.RequestVote", args, &reply)
 	if err != nil {
