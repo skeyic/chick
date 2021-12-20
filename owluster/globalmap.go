@@ -7,8 +7,10 @@ import (
 )
 
 type GlobalMap struct {
-	Data map[string]string
-	Lock *sync.RWMutex
+	Data  map[string]string
+	Lock  *sync.RWMutex
+	Term  int
+	Index int
 }
 
 func NewGlobalMap() *GlobalMap {
@@ -21,6 +23,12 @@ func NewGlobalMap() *GlobalMap {
 func (g *GlobalMap) Zip() []byte {
 	body, _ := json.Marshal(g)
 	return body
+}
+
+func (g *GlobalMap) Version() (int, int) {
+	g.Lock.RLock()
+	defer g.Lock.RUnlock()
+	return g.Term, g.Index
 }
 
 type Message struct {
@@ -36,8 +44,7 @@ const (
 )
 
 // Do ...
-// msg examples:
-func (g *GlobalMap) Do(msg string) {
+func (g *GlobalMap) Do(msg string, term, index int) {
 	var (
 		message = new(Message)
 	)
@@ -48,15 +55,27 @@ func (g *GlobalMap) Do(msg string) {
 	}
 
 	glog.V(4).Infof("MSG: %+v", message)
+	g.Lock.RLock()
+	myTerm, myIndex := g.Term, g.Index
+	g.Lock.RUnlock()
+	if myTerm > term || (myTerm == term && myIndex >= index) {
+		glog.V(10).Infof("No need to update, myTerm: %d, myIndex: %d, msg term: %d, msg index: %d",
+			myTerm, myIndex, term, index)
+		return
+	}
 
 	switch message.Action {
 	case AddAction, UpdateAction:
 		g.Lock.Lock()
 		g.Data[message.Key] = message.Value
+		g.Term = term
+		g.Index = index
 		g.Lock.Unlock()
 	case DeleteAction:
 		g.Lock.Lock()
 		delete(g.Data, message.Key)
+		g.Term = term
+		g.Index = index
 		g.Lock.Unlock()
 	default:
 		glog.Errorf("Unknown action: %s, msg: %s", message.Action, msg)

@@ -37,9 +37,9 @@ const (
 )
 
 type OwlData interface {
-	Zip() []byte   // struct to bytes
-	Do(msg string) // follow the log entry
-	Version() int  // committed log index
+	Zip() []byte                    // struct to bytes
+	Do(msg string, term, index int) // follow the log entry
+	Version() (int, int)            // committed log index
 }
 
 type LogEntry struct {
@@ -120,9 +120,6 @@ func (m *Maw) getLastTerm() int {
 func (m *Maw) getLogsSince(start int) []*LogEntry {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
-	//if start == -1 {
-	//	return m.logs
-	//}
 	return m.logs[start+1:]
 }
 
@@ -167,19 +164,19 @@ func (m *Maw) maybeSnapshot() {
 const healthCheckGap = 3
 
 type healthChecker struct {
-	lock    *sync.RWMutex
-	idx     int
-	lastIdx int
-	count   int
-	nodes   map[string]int
+	lock           *sync.RWMutex
+	idx            int
+	lastHealthyIdx int
+	count          int
+	nodes          map[string]int
 }
 
 func newHealthChecker() *healthChecker {
 	return &healthChecker{
-		lock:    &sync.RWMutex{},
-		idx:     -1,
-		lastIdx: -1,
-		nodes:   make(map[string]int),
+		lock:           &sync.RWMutex{},
+		idx:            -1,
+		lastHealthyIdx: -1,
+		nodes:          make(map[string]int),
 	}
 }
 
@@ -191,7 +188,7 @@ func (h *healthChecker) start() int {
 	return h.idx
 }
 
-func (h *healthChecker) Add(address string, idx int) {
+func (h *healthChecker) add(address string, idx int) {
 	h.lock.Lock()
 	defer h.lock.Unlock()
 
@@ -199,7 +196,7 @@ func (h *healthChecker) Add(address string, idx int) {
 	if idx == h.idx {
 		h.count++
 		if h.count >= len(h.nodes)/2+1 {
-			h.lastIdx = h.idx
+			h.lastHealthyIdx = h.idx
 		}
 	}
 }
@@ -207,9 +204,9 @@ func (h *healthChecker) Add(address string, idx int) {
 func (h *healthChecker) isHealthy() bool {
 	h.lock.Lock()
 	defer h.lock.Unlock()
-	glog.V(4).Infof("IDX: %d, LAST: %d, HEALTHY: %v", h.idx, h.lastIdx, h.idx-h.lastIdx < healthCheckGap)
+	glog.V(4).Infof("IDX: %d, LAST: %d, HEALTHY: %v", h.idx, h.lastHealthyIdx, h.idx-h.lastHealthyIdx < healthCheckGap)
 	glog.V(4).Infof("IDXs: %+v", h.nodes)
-	return h.idx-h.lastIdx < healthCheckGap
+	return h.idx-h.lastHealthyIdx < healthCheckGap
 }
 
 // Owl node
@@ -756,7 +753,7 @@ func (o *Owl) sendHeartbeat(serverAddress string, args HeartbeatArgs, reply *Hea
 			o.clusterNodeStatsMap[serverAddress].SetLogIndex(reply.CurrentLogIndex)
 			o.clusterLock.Unlock()
 		}
-		o.healthChecker.Add(reply.Me, reply.Idx)
+		o.healthChecker.add(reply.Me, reply.Idx)
 	} else {
 		glog.V(4).Infof("sendHeartbeat REPLY from %s: ARGS: %+v, REPLY: %+v", serverAddress, args, reply)
 		// TWO CASES:
