@@ -1,6 +1,7 @@
 package owluster
 
 import (
+	"bytes"
 	"github.com/golang/glog"
 	"io/ioutil"
 	"log"
@@ -15,6 +16,12 @@ func NewServer(beak *Beak) *Server {
 	return &Server{beak: beak}
 }
 
+func responseOK(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusOK)
+	body := bytes.NewBufferString("{\"Status\":\"OK\"}")
+	w.Write(body.Bytes())
+}
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//key := r.RequestURI
 	defer r.Body.Close()
@@ -26,13 +33,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Failed on POST", http.StatusBadRequest)
 			return
 		}
-		glog.V(4).Infof("MSG: %s", msg)
-		//glog.V(4).Infof("CHEW: %s, ERROR: %+v", msg, s.beak.Chew(string(msg)))
 		glog.V(4).Infof("EAT: %s", msg)
 		s.beak.Eat(string(msg))
-
-		glog.V(4).Infof("FINISH: %s", msg)
-		w.WriteHeader(http.StatusNoContent)
+		responseOK(w)
 	default:
 		w.Header().Set("Allow", http.MethodPost)
 		//w.Header().Add("Allow", http.MethodGet)

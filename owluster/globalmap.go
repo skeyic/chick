@@ -25,6 +25,13 @@ func (g *GlobalMap) Zip() []byte {
 	return body
 }
 
+func (g *GlobalMap) Unzip(body []byte) {
+	err := json.Unmarshal(body, &g)
+	if err != nil {
+		panic(err)
+	}
+}
+
 func (g *GlobalMap) Version() (int, int) {
 	g.Lock.RLock()
 	defer g.Lock.RUnlock()
@@ -54,7 +61,7 @@ func (g *GlobalMap) Do(msg string, term, index int) {
 		return
 	}
 
-	glog.V(4).Infof("MSG: %+v", message)
+	glog.V(4).Infof("DO MSG: %+v", message)
 	g.Lock.RLock()
 	myTerm, myIndex := g.Term, g.Index
 	g.Lock.RUnlock()
@@ -80,4 +87,14 @@ func (g *GlobalMap) Do(msg string, term, index int) {
 	default:
 		glog.Errorf("Unknown action: %s, msg: %s", message.Action, msg)
 	}
+}
+
+// Report ...
+func (g *GlobalMap) Report() {
+	glog.V(4).Infof("GM REPORT: IDX: %d, TERM: %d", g.Index, g.Term)
+	g.Lock.RLock()
+	for key, value := range g.Data {
+		glog.V(4).Infof("KEY: %s, VALUE: %s", key, value)
+	}
+	g.Lock.RUnlock()
 }
