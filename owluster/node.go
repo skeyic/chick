@@ -21,8 +21,9 @@ var (
 
 // node cluster node
 type node struct {
-	connect bool
-	address string
+	//connect  bool
+	address           string
+	isMasterCandidate bool
 }
 
 // State int
@@ -198,11 +199,12 @@ func (m *Maw) maybeSnapshot() {
 const healthCheckGap = 3
 
 type healthChecker struct {
-	lock           *sync.RWMutex
-	idx            int
-	lastHealthyIdx int
-	count          int
-	nodes          map[string]int
+	lock               *sync.RWMutex
+	idx                int
+	lastHealthyIdx     int
+	masterCheckedCount int
+	nodes              map[string]int
+	masterNum          int
 }
 
 func newHealthChecker() *healthChecker {
@@ -218,7 +220,7 @@ func (h *healthChecker) start() int {
 	h.lock.Lock()
 	defer h.lock.Unlock()
 	h.idx++
-	h.count = 1 // we have myself
+	h.masterCheckedCount = 1 // we have myself
 	return h.idx
 }
 
@@ -228,8 +230,8 @@ func (h *healthChecker) add(address string, idx int) {
 
 	h.nodes[address] = idx
 	if idx == h.idx {
-		h.count++
-		if h.count >= len(h.nodes)/2+1 {
+		h.masterCheckedCount++
+		if h.masterCheckedCount >= h.masterNum/2+1 {
 			h.lastHealthyIdx = h.idx
 		}
 	}
@@ -254,9 +256,8 @@ func (h *healthChecker) isHealthy() bool {
 
 // Owl node
 type Owl struct {
-	// my id
-	me      string
-	address string
+	// my address
+	me string
 
 	// process channel
 	proposeC chan *food
@@ -267,6 +268,10 @@ type Owl struct {
 
 	// other nodes except me
 	nodes map[string]*node
+
+	// able to become master
+	isMasterCandidate  bool
+	masterCandidateNum int
 
 	// rpc client to other nodes
 	clientLock *sync.RWMutex
@@ -285,7 +290,7 @@ type Owl struct {
 	voteLock *sync.RWMutex
 	votedFor string
 
-	// get voted count in this term
+	// get voted masterCheckedCount in this term
 	voteCount    int
 	preVoteCount int
 
@@ -387,9 +392,12 @@ func NewOwl(address, cluster string, beak *Beak, data OwlData) *Owl {
 	for _, v := range clusters {
 		// Ignore myself
 		if v != address {
-			owl.nodes[v] = &node{address: v}
+			owl.nodes[v] = &node{address: v, isMasterCandidate: true}
 			owl.healthChecker.nodes[v] = -1
+		} else {
+			owl.isMasterCandidate = true
 		}
+		owl.masterCandidateNum++
 	}
 
 	owl.rpc(address)
@@ -500,8 +508,10 @@ func (o *Owl) step() {
 				glog.V(10).Infof("follower-%s receives heartbeat", o.me)
 
 			case <-time.After(time.Duration(rand.Intn(500-300)+300) * time.Millisecond):
-				glog.V(4).Infof("follower-%s receives heartbeat timeout, Follower => PreCandidate", o.me)
-				o.state = PreCandidate
+				if o.isMasterCandidate {
+					glog.V(4).Infof("follower-%s receives heartbeat timeout, Follower => PreCandidate", o.me)
+					o.state = PreCandidate
+				}
 			}
 
 		case PreCandidate:
@@ -609,6 +619,7 @@ const (
 	MyTermHigher VoteReason = iota + 1
 	MyCommittedLogIndexHigher
 	AlreadyVoted
+	NotMasterCandidate
 )
 
 type VoteReply struct {
@@ -634,16 +645,21 @@ func (o *Owl) broadcastRequestVote(preVote bool) {
 	}
 
 	for _, i := range o.nodes {
-		go func(i string) {
-			var (
-				reply = new(VoteReply)
-			)
-			o.sendRequestVote(i, args, reply)
-		}(i.address)
+		if i.isMasterCandidate {
+			go func(i *node) {
+				var (
+					reply = new(VoteReply)
+				)
+				o.sendRequestVote(i, args, reply)
+			}(i)
+		}
 	}
 }
 
-func (o *Owl) sendRequestVote(serverAddress string, args VoteArgs, reply *VoteReply) {
+func (o *Owl) sendRequestVote(server *node, args VoteArgs, reply *VoteReply) {
+	var (
+		serverAddress = server.address
+	)
 	client, err := o.getClient(serverAddress)
 	if err != nil {
 		glog.V(10).Infof("failed to get rpc client to node %s with error %v", serverAddress, err)
@@ -662,7 +678,7 @@ func (o *Owl) sendRequestVote(serverAddress string, args VoteArgs, reply *VoteRe
 		if reply.VoteGranted {
 			o.preVoteCount++
 
-			if o.preVoteCount >= len(o.nodes)/2+1 {
+			if o.preVoteCount >= o.masterCandidateNum/2+1 {
 				o.toCandidateC <- true
 			}
 		}
@@ -677,7 +693,7 @@ func (o *Owl) sendRequestVote(serverAddress string, args VoteArgs, reply *VoteRe
 		if reply.VoteGranted {
 			o.voteCount++
 
-			if o.voteCount >= len(o.nodes)/2+1 {
+			if o.voteCount >= o.masterCandidateNum/2+1 {
 				o.toLeaderC <- true
 			}
 		}
@@ -686,6 +702,13 @@ func (o *Owl) sendRequestVote(serverAddress string, args VoteArgs, reply *VoteRe
 
 func (o *Owl) RequestVote(args VoteArgs, reply *VoteReply) error {
 	reply.Me = o.me
+
+	if !o.isMasterCandidate {
+		reply.Reason = NotMasterCandidate
+		reply.VoteGranted = false
+		return nil
+	}
+
 	reply.CurrentTerm = o.currentTerm
 	reply.CommittedLogIndex = o.getLastLogIndex()
 
@@ -781,16 +804,20 @@ func (o *Owl) broadcastHeartbeat() {
 			}
 		}
 
-		go func(i string, args HeartbeatArgs) {
+		go func(i *node, args HeartbeatArgs) {
 			var (
 				reply = new(HeartbeatReply)
 			)
 			o.sendHeartbeat(i, args, reply)
-		}(i.address, args)
+		}(i, args)
 	}
 }
 
-func (o *Owl) sendHeartbeat(serverAddress string, args HeartbeatArgs, reply *HeartbeatReply) {
+func (o *Owl) sendHeartbeat(server *node, args HeartbeatArgs, reply *HeartbeatReply) {
+	var (
+		serverAddress = server.address
+	)
+
 	defer func() {
 		if args.WithData() {
 			o.clusterLock.Lock()
@@ -818,16 +845,20 @@ func (o *Owl) sendHeartbeat(serverAddress string, args HeartbeatArgs, reply *Hea
 			o.clusterNodeStatsMap[serverAddress].SetLogIndex(reply.Idx, reply.CurrentLogIndex)
 			o.clusterLock.Unlock()
 		}
-		o.healthChecker.add(reply.Me, reply.Idx)
+		if server.isMasterCandidate {
+			o.healthChecker.add(reply.Me, reply.Idx)
+		}
 	} else {
 		glog.V(4).Infof("sendHeartbeat REPLY from %s: ARGS: %+v, REPLY: %+v", serverAddress, args, reply)
 		// TWO CASES:
 		// 1. its term is higher than mine, we need to become the follower
 		// 2. the prev log index is not correct, do nothing, next time heartbeat we will send using the correct index
-		if reply.Term > o.currentTerm {
-			o.currentTerm = reply.Term
-			o.state = Follower
-			o.votedFor = ""
+		if server.isMasterCandidate {
+			if reply.Term > o.currentTerm {
+				o.currentTerm = reply.Term
+				o.state = Follower
+				o.votedFor = ""
+			}
 		}
 	}
 	//if args.WithData() {
