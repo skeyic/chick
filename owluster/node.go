@@ -37,9 +37,9 @@ const (
 )
 
 type OwlData interface {
-	Zip() []byte  // struct to bytes
-	Unzip([]byte) // bytes to struct
-	Do(msg string, term, index int)
+	Zip() []byte         // struct to bytes
+	Unzip([]byte)        // bytes to struct
+	Do(entry *LogEntry)  // do log
 	Version() (int, int) // committed log index
 	Report()
 }
@@ -48,7 +48,8 @@ type LogEntry struct {
 	LogTerm  int
 	LogIndex int
 
-	Msg string
+	Msg  string
+	Done bool
 }
 
 type food struct {
@@ -134,41 +135,43 @@ func (m *Maw) getLogsSince(startIdx int) []*LogEntry {
 	return m.logs[realIdx+1:]
 }
 
-func (m *Maw) emptyBySnapshot(data OwlData) {
+func (m *Maw) emptyByData(data OwlData) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 	m.logs = nil
 	m.lastTerm, m.lastIndex = data.Version()
 }
 
-func (m *Maw) appendLog(msg string, term int) int {
+func (m *Maw) appendLog(msg string, term int) *LogEntry {
+	m.maybeSnapshot()
 	m.lock.Lock()
 	defer m.lock.Unlock()
+
 	m.lastTerm = term
 	m.lastIndex++
-	m.logs = append(m.logs,
-		&LogEntry{
-			LogTerm:  term,
-			LogIndex: m.lastIndex,
-			Msg:      msg,
-		},
-	)
-	return m.lastIndex
+	newLog := &LogEntry{
+		LogTerm:  term,
+		LogIndex: m.lastIndex,
+		Msg:      msg,
+	}
+	m.logs = append(m.logs, newLog)
+	return newLog
 }
 
-func (m *Maw) addLog(msg string, term, index int) int {
+func (m *Maw) addLog(msg string, term, index int) *LogEntry {
+	m.maybeSnapshot()
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	m.logs = append(m.logs,
-		&LogEntry{
-			LogTerm:  term,
-			LogIndex: index,
-			Msg:      msg,
-		},
-	)
+
 	m.lastIndex = index
 	m.lastTerm = term
-	return index
+	newLog := &LogEntry{
+		LogTerm:  term,
+		LogIndex: index,
+		Msg:      msg,
+	}
+	m.logs = append(m.logs, newLog)
+	return newLog
 }
 
 func (m *Maw) report() {
@@ -180,8 +183,16 @@ func (m *Maw) report() {
 	}
 }
 
+const defaultSnapshotSize = 10
+
 func (m *Maw) maybeSnapshot() {
-	// Remove committed maw from the maw if there are already too many there
+	m.lock.Lock()
+	if len(m.logs) > defaultSnapshotSize {
+		if m.logs[defaultSnapshotSize].Done {
+			m.logs = m.logs[defaultSnapshotSize:]
+		}
+	}
+	m.lock.Unlock()
 }
 
 const healthCheckGap = 3
@@ -305,9 +316,6 @@ type Owl struct {
 	clusterNodeStatsMap map[string]*nodeStats
 }
 
-// healthCheckState int
-type healthCheckState int
-
 type nodeStats struct {
 	idx            int
 	logIndex       int
@@ -330,7 +338,7 @@ func (n *nodeStats) TryDataProcessing() bool {
 		return false
 	}
 	n.dataProcessing = true
-	glog.V(4).Info("SET DATA PROCESSING")
+	//glog.V(4).Info("SET DATA PROCESSING")
 	return true
 }
 
@@ -338,7 +346,7 @@ func (n *nodeStats) FinishDataProcessing() {
 	n.lock.Lock()
 	defer n.lock.Unlock()
 	n.dataProcessing = false
-	glog.V(4).Info("BACK DATA PROCESSING")
+	//glog.V(4).Info("BACK DATA PROCESSING")
 }
 
 func (n *nodeStats) GetLogIndex() (int, int) {
@@ -385,8 +393,6 @@ func NewOwl(address, cluster string, beak *Beak, data OwlData) *Owl {
 	}
 
 	owl.rpc(address)
-
-	//go owl.clientHealthCheck()
 
 	owl.start()
 
@@ -550,7 +556,7 @@ func (o *Owl) serveChannels() {
 	for {
 		select {
 		case food := <-o.beak.proposeC:
-			glog.V(4).Infof("ROLE: %d, FOOD: %+v", o.state, food)
+			//glog.V(4).Infof("ROLE: %d, FOOD: %+v", o.state, food)
 			switch o.state {
 			case Follower:
 				food.errorC <- o.forwardDataToLeader(food.msg)
@@ -578,7 +584,7 @@ func (o *Owl) processData(msg string) error {
 	if !o.isHealthy() {
 		return errClusterNotHealthy
 	}
-	o.data.Do(msg, o.currentTerm,
+	o.data.Do(
 		o.maw.appendLog(msg, o.currentTerm),
 	)
 	return nil
@@ -763,14 +769,14 @@ func (o *Owl) broadcastHeartbeat() {
 			args.PrevLogTerm = o.maw.getLastTerm()
 			if prevLogIndex == -1 {
 				args.Data = o.data.Zip()
-				glog.V(4).Infof("TO NODE: %s, IDX: %d, PI: %d, SEND DATA %s", i.address, idx, prevLogIndex, args.Data)
+				//glog.V(4).Infof("TO NODE: %s, IDX: %d, PI: %d, SEND DATA %s", i.address, idx, prevLogIndex, args.Data)
 			} else {
 				args.Logs = o.maw.getLogsSince(prevLogIndex)
 				if len(args.Logs) == 0 {
 					args.Data = o.data.Zip()
-					glog.V(4).Infof("DATA INSTEAD LOGS, TO NODE: %s, IDX: %d, PI: %d, SEND DATA %s", i.address, idx, prevLogIndex, args.Data)
+					//glog.V(4).Infof("DATA INSTEAD LOGS, TO NODE: %s, IDX: %d, PI: %d, SEND DATA %s", i.address, idx, prevLogIndex, args.Data)
 				} else {
-					glog.V(4).Infof("TO NODE: %s, IDX: %d, PI: %d, SEND LOGS %v", i.address, idx, prevLogIndex, args.Logs)
+					//glog.V(4).Infof("TO NODE: %s, IDX: %d, PI: %d, SEND LOGS %v", i.address, idx, prevLogIndex, args.Logs)
 				}
 			}
 		}
@@ -799,7 +805,7 @@ func (o *Owl) sendHeartbeat(serverAddress string, args HeartbeatArgs, reply *Hea
 		return
 	}
 
-	glog.V(10).Infof("sendHeartbeat to %s, ARGS: %+v", serverAddress, args)
+	//glog.V(10).Infof("sendHeartbeat to %s, ARGS: %+v", serverAddress, args)
 	err = client.Call("Owl.Heartbeat", args, &reply)
 	if err != nil {
 		glog.V(4).Infof("failed to call %s with error %v", "Owl.Heartbeat", err)
@@ -824,9 +830,9 @@ func (o *Owl) sendHeartbeat(serverAddress string, args HeartbeatArgs, reply *Hea
 			o.votedFor = ""
 		}
 	}
-	if args.WithData() {
-		glog.V(4).Infof("ARGS: %+v, REPLY: %+v", args, reply)
-	}
+	//if args.WithData() {
+	//	glog.V(4).Infof("ARGS: %+v, REPLY: %+v", args, reply)
+	//}
 }
 
 func (o *Owl) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
@@ -860,10 +866,10 @@ func (o *Owl) Heartbeat(args HeartbeatArgs, reply *HeartbeatReply) error {
 	if args.PrevLogIndex == o.getLastLogIndex() {
 		if len(args.Data) != 0 {
 			o.data.Unzip(args.Data)
-			o.maw.emptyBySnapshot(o.data)
+			o.maw.emptyByData(o.data)
 		} else {
 			for _, log := range args.Logs {
-				o.data.Do(log.Msg, log.LogTerm,
+				o.data.Do(
 					o.maw.addLog(log.Msg, log.LogTerm, log.LogIndex),
 				)
 			}

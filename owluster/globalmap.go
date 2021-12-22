@@ -51,10 +51,15 @@ const (
 )
 
 // Do ...
-func (g *GlobalMap) Do(msg string, term, index int) {
+func (g *GlobalMap) Do(log *LogEntry) {
 	var (
+		msg     = log.Msg
+		term    = log.LogTerm
+		index   = log.LogIndex
 		message = new(Message)
 	)
+	defer func() { log.Done = true }()
+
 	err := json.Unmarshal([]byte(msg), &message)
 	if err != nil {
 		glog.Errorf("failed to unmarshal msg: %s, error: %v", msg, err)
