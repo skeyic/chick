@@ -6,16 +6,44 @@ import (
 	"sync"
 )
 
+type theData interface {
+	Do(message *Message)
+	Report()
+}
+
+type GlobalData map[string]string
+
+func NewGlobalData() GlobalData {
+	return make(map[string]string)
+}
+
+func (g GlobalData) Do(message *Message) {
+	switch message.Action {
+	case AddAction, UpdateAction:
+		g[message.Key] = message.Value
+	case DeleteAction:
+		delete(g, message.Key)
+	default:
+		glog.Errorf("Unknown action: %s, msg: %s", message.Action, message)
+	}
+}
+
+func (g GlobalData) Report() {
+	for key, value := range g {
+		glog.V(4).Infof("KEY: %s, VALUE: %s", key, value)
+	}
+}
+
 type GlobalMap struct {
-	Data  map[string]string
+	Data  theData
 	Lock  *sync.RWMutex
 	Term  int
 	Index int
 }
 
-func NewGlobalMap() *GlobalMap {
+func NewGlobalMap(data theData) *GlobalMap {
 	return &GlobalMap{
-		Data: make(map[string]string),
+		Data: data,
 		Lock: &sync.RWMutex{},
 	}
 }
@@ -76,30 +104,17 @@ func (g *GlobalMap) Do(log *LogEntry) {
 		return
 	}
 
-	switch message.Action {
-	case AddAction, UpdateAction:
-		g.Lock.Lock()
-		g.Data[message.Key] = message.Value
-		g.Term = term
-		g.Index = index
-		g.Lock.Unlock()
-	case DeleteAction:
-		g.Lock.Lock()
-		delete(g.Data, message.Key)
-		g.Term = term
-		g.Index = index
-		g.Lock.Unlock()
-	default:
-		glog.Errorf("Unknown action: %s, msg: %s", message.Action, msg)
-	}
+	g.Lock.Lock()
+	g.Data.Do(message)
+	g.Term = term
+	g.Index = index
+	g.Lock.Unlock()
 }
 
 // Report ...
 func (g *GlobalMap) Report() {
 	glog.V(4).Infof("GM REPORT: IDX: %d, TERM: %d", g.Index, g.Term)
 	g.Lock.RLock()
-	for key, value := range g.Data {
-		glog.V(4).Infof("KEY: %s, VALUE: %s", key, value)
-	}
+	g.Data.Report()
 	g.Lock.RUnlock()
 }

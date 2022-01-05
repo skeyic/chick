@@ -23,7 +23,8 @@ func main() {
 
 	flag.Parse()
 	beak := owluster.NewBeak()
-	owluster.NewOwl(*address, *cluster, beak, owluster.NewGlobalMap())
+	data := owluster.NewGlobalData()
+	owluster.NewOwl(*address, *cluster, beak, owluster.NewGlobalMap(data))
 	owluster.ServeHttpKVAPI(*httpport, owluster.NewServer(beak))
 
 	glog.V(4).Info("STARTED")
