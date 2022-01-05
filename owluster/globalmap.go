@@ -8,6 +8,8 @@ import (
 
 type theData interface {
 	Do(message *Message)
+	Zip() []byte
+	Unzip([]byte)
 	Report()
 }
 
@@ -35,7 +37,7 @@ func (g GlobalData) Report() {
 }
 
 type GlobalMap struct {
-	Data  theData
+	Data  theData `json:"Data"`
 	Lock  *sync.RWMutex
 	Term  int
 	Index int
