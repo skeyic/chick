@@ -30,6 +30,21 @@ func (g GlobalData) Do(message *Message) {
 	}
 }
 
+func (g GlobalData) Zip() []byte {
+	bs, err := json.Marshal(g)
+	if err != nil {
+		panic(err)
+	}
+	return bs
+}
+
+func (g GlobalData) Unzip(bs []byte) {
+	err := json.Unmarshal(bs, &g)
+	if err != nil {
+		panic(err)
+	}
+}
+
 func (g GlobalData) Report() {
 	for key, value := range g {
 		glog.V(4).Infof("KEY: %s, VALUE: %s", key, value)
@@ -37,10 +52,10 @@ func (g GlobalData) Report() {
 }
 
 type GlobalMap struct {
-	Data  theData `json:"Data"`
+	Data  theData `json:"data"`
 	Lock  *sync.RWMutex
-	Term  int
-	Index int
+	Term  int `json:"term"`
+	Index int `json:"index"`
 }
 
 func NewGlobalMap(data theData) *GlobalMap {
@@ -56,10 +71,23 @@ func (g *GlobalMap) Zip() []byte {
 }
 
 func (g *GlobalMap) Unzip(body []byte) {
-	err := json.Unmarshal(body, &g)
+	var (
+		temp interface{}
+	)
+	err := json.Unmarshal(body, &temp)
 	if err != nil {
 		panic(err)
 	}
+
+	var tempD = temp.(map[string]interface{})
+	g.Index = int(tempD["index"].(float64))
+	g.Term = int(tempD["term"].(float64))
+	bs, err := json.Marshal(tempD["data"])
+	if err != nil {
+		panic(err)
+	}
+	g.Data.Unzip(bs)
+
 }
 
 func (g *GlobalMap) Version() (int, int) {
