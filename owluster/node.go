@@ -262,6 +262,19 @@ func (h *healthChecker) isHealthy() bool {
 	return h.idx-h.lastHealthyIdx < healthCheckGap
 }
 
+func (h *healthChecker) getHealthyNodesNum() (num int) {
+	h.lock.RLock()
+	defer h.lock.RUnlock()
+	for _, nodeIdx := range h.nodes {
+		if h.idx-nodeIdx < healthCheckGap {
+			num++
+		}
+	}
+	// Add myself
+	num++
+	return
+}
+
 // Owl node
 type Owl struct {
 	// my Address
@@ -333,14 +346,16 @@ type Owl struct {
 }
 
 type nodeStats struct {
+	node           string
 	logIndex       int
 	term           int
 	dataProcessing bool
 	lock           *sync.RWMutex
 }
 
-func newNodeStats() *nodeStats {
+func newNodeStats(node string) *nodeStats {
 	return &nodeStats{
+		node:     node,
 		logIndex: -1,
 		term:     -1,
 		lock:     &sync.RWMutex{},
@@ -431,6 +446,11 @@ func (o *Owl) rpc(port string) {
 	go http.Serve(lis, nil)
 }
 
+func (o *Owl) IncreaseTerm() {
+	o.currentTerm++
+	o.updateMyStatus()
+}
+
 func (o *Owl) getLastLogIndex() int {
 	return o.maw.getLastIndex()
 }
@@ -504,6 +524,26 @@ func (o *Owl) updateNodes(nodes []*node) {
 	}
 }
 
+func (o *Owl) getNodesStatus() []*nodeStats {
+	o.clusterLock.RLock()
+	defer o.clusterLock.RUnlock()
+	var nodes []*nodeStats
+	for _, n := range o.clusterNodeStatsMap {
+		nodes = append(nodes, n)
+	}
+	return nodes
+}
+
+func (o *Owl) updateMyStatus() {
+	o.clusterLock.Lock()
+	status := o.clusterNodeStatsMap[o.me]
+	status.lock.Lock()
+	status.logIndex = o.getLastLogIndex()
+	status.term = o.currentTerm
+	status.lock.Unlock()
+	o.clusterLock.Unlock()
+}
+
 func (o *Owl) isMe(n *node) bool {
 	return o.me == n.Address
 }
@@ -574,7 +614,7 @@ func (o *Owl) step() {
 			}
 
 		case Candidate:
-			o.currentTerm++
+			o.IncreaseTerm()
 			o.setVoteFor(o.me)
 			o.voteCount = 1
 			glog.V(4).Infof("node-%s is a candidate, vote for myself, my term: %d", o.me, o.currentTerm)
@@ -590,10 +630,12 @@ func (o *Owl) step() {
 
 				o.clusterLock.Lock()
 				for _, i := range o.nodes {
-					o.clusterNodeStatsMap[i.Address] = newNodeStats()
+					o.clusterNodeStatsMap[i.Address] = newNodeStats(i.Address)
 				}
 				o.clusterLock.Unlock()
 
+				o.leaderAddress = o.me
+				o.updateMyStatus()
 				o.state = Leader
 			}
 
@@ -647,6 +689,7 @@ func (o *Owl) processData(msg string) error {
 	o.data.Do(
 		o.maw.appendLog(msg, o.currentTerm),
 	)
+	o.updateMyStatus()
 	return nil
 }
 
@@ -1133,9 +1176,9 @@ func (o *Owl) RequestJoin(args JoinArgs, reply *JoinReply) error {
 		o.nodes[args.Address] = &node{
 			Address: args.Address,
 		}
-		o.clusterNodeStatsMap[args.Address] = newNodeStats()
+		o.clusterNodeStatsMap[args.Address] = newNodeStats(args.Address)
 		o.clusterLock.Unlock()
-		o.currentTerm++
+		o.IncreaseTerm()
 
 		reply.JoinAccepted = true
 	}

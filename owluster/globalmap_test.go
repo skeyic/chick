@@ -3,12 +3,11 @@ package owluster
 import (
 	"encoding/json"
 	"github.com/golang/glog"
-	"github.com/skeyic/chick/utils"
 	"testing"
 )
 
 func Test_GlobalMap(t *testing.T) {
-	utils.EnableGlogForTesting()
+	EnableGlogForTesting()
 
 	var (
 		m1 = Message{

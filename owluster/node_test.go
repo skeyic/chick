@@ -2,7 +2,6 @@ package owluster
 
 import (
 	"fmt"
-	"github.com/skeyic/chick/utils"
 	"log"
 	"net"
 	"net/http"
@@ -11,7 +10,7 @@ import (
 )
 
 func TestRPC(t *testing.T) {
-	utils.EnableGlogForTesting()
+	EnableGlogForTesting()
 
 	rpc.Register(new(Owl))
 	rpc.HandleHTTP()
@@ -24,7 +23,7 @@ func TestRPC(t *testing.T) {
 }
 
 func TestRPCClient2(t *testing.T) {
-	utils.EnableGlogForTesting()
+	EnableGlogForTesting()
 
 	client, err := rpc.DialHTTP("tcp", ":9001")
 	if err != nil {

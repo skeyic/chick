@@ -8,6 +8,7 @@ import (
 
 type theData interface {
 	Do(message *Message)
+	Get(key string) (bool, string)
 	Zip() []byte
 	Unzip([]byte)
 	Report()
@@ -43,6 +44,11 @@ func (g GlobalData) Unzip(bs []byte) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func (g GlobalData) Get(key string) (bool, string) {
+	value, hit := g[key]
+	return hit, value
 }
 
 func (g GlobalData) Report() {
@@ -94,6 +100,13 @@ func (g *GlobalMap) Version() (int, int) {
 	g.Lock.RLock()
 	defer g.Lock.RUnlock()
 	return g.Term, g.Index
+}
+
+func (g *GlobalMap) Get(key string) (bool, string, int, int) {
+	g.Lock.RLock()
+	defer g.Lock.RUnlock()
+	hit, value := g.Data.Get(key)
+	return hit, value, g.Term, g.Index
 }
 
 type Message struct {
