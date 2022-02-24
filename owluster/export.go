@@ -50,6 +50,15 @@ func StartClusterAPIServer(port string) {
 	}()
 }
 
-func GetCurrentHealthyNodeNum() int {
-	return TheOWLNode.healthChecker.getHealthyNodesNum()
+func GetCurrentHealthyNodeNum() (int, error) {
+	if TheOWLNode.state == Leader {
+		return TheOWLNode.healthChecker.getHealthyNodesNum(), nil
+	}
+
+	replyBody, err := TheOWLNode.sendClusterActionToLeader(ActionGetHealthyNodeNum)
+	if err != nil {
+		return -1, err
+	}
+
+	return replyBody.(int), nil
 }

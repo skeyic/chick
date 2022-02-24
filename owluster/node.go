@@ -14,9 +14,11 @@ import (
 
 // Errors ..
 var (
-	errRPCConnectFailed  = errors.New("failed to connect through RPC")
-	errLeaderNotElected  = errors.New("leader not elected")
-	errClusterNotHealthy = errors.New("cluster not healthy")
+	errRPCConnectFailed     = errors.New("failed to connect through RPC")
+	errLeaderNotElected     = errors.New("leader not elected")
+	errClusterNotHealthy    = errors.New("cluster not healthy")
+	errNotLeader            = errors.New("not leader")
+	errUnknownClusterAction = errors.New("unknown cluster action")
 )
 
 // node cluster node
@@ -614,7 +616,7 @@ func (o *Owl) step() {
 			}
 
 		case Candidate:
-			o.IncreaseTerm()
+			o.currentTerm++
 			o.setVoteFor(o.me)
 			o.voteCount = 1
 			glog.V(4).Infof("node-%s is a candidate, vote for myself, my term: %d", o.me, o.currentTerm)
@@ -1181,6 +1183,64 @@ func (o *Owl) RequestJoin(args JoinArgs, reply *JoinReply) error {
 		o.IncreaseTerm()
 
 		reply.JoinAccepted = true
+	}
+
+	return nil
+}
+
+type ClusterAction int
+
+const (
+	ActionGetHealthyNodeNum ClusterAction = iota
+)
+
+type ClusterActionArgs struct {
+	Action ClusterAction
+}
+
+type ClusterActionReply struct {
+	Body  interface{}
+	Error error
+}
+
+func (o *Owl) sendClusterActionToLeader(action ClusterAction) (interface{}, error) {
+	var (
+		args = &ClusterActionArgs{
+			Action: action,
+		}
+		reply    = new(ClusterActionReply)
+		leaderID = o.leaderAddress
+	)
+
+	if leaderID == "" {
+		return "", errLeaderNotElected
+	}
+
+	client, err := o.getClient(leaderID)
+	if err != nil {
+		glog.V(10).Infof("failed to get rpc client to node %s with error %v", leaderID, err)
+		return "", errRPCConnectFailed
+	}
+
+	err = client.Call("Owl.RequestClusterAction", args, reply)
+	glog.V(4).Infof("ARGS: %+v, REPLY: %+v", args, reply)
+	if err != nil {
+		glog.Errorf("failed to call %s with error %v", "Owl.ReceiveData", err)
+		return "", errRPCConnectFailed
+	}
+	return reply.Body, reply.Error
+}
+
+func (o *Owl) RequestClusterAction(args ClusterActionArgs, reply *ClusterActionReply) error {
+	if o.state != Leader {
+		return errNotLeader
+	}
+
+	switch args.Action {
+	case ActionGetHealthyNodeNum:
+		reply.Body = o.healthChecker.getHealthyNodesNum()
+	default:
+		reply.Error = errUnknownClusterAction
 	}
 
 	return nil

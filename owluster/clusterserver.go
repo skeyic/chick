@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
-	"strconv"
 )
 
 type ClusterAPIServer struct {
@@ -17,10 +16,15 @@ func NewClusterAPIServer(owl *Owl) *ClusterAPIServer {
 	}
 }
 
+func ServiceUnavailableError(w http.ResponseWriter) {
+	w.WriteHeader(http.StatusServiceUnavailable)
+	w.Write(bytes.NewBufferString("{\"Error\":\"Service is unavailable\"}").Bytes())
+}
+
 func (s *ClusterAPIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !s.owl.isHealthy() {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write(bytes.NewBufferString("{\"Error\":\"Service is unavailable\"}").Bytes())
+		ServiceUnavailableError(w)
+		return
 	}
 
 	defer r.Body.Close()
@@ -73,12 +77,13 @@ func (s *ClusterAPIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		case "/healthy_nodes_num":
 			{
-				if s.owl.state != Leader {
-					w.WriteHeader(http.StatusOK)
-					w.Write(bytes.NewBufferString(fmt.Sprintf(`{"ERROR": "Please query master node %s"}`, s.owl.leaderAddress)).Bytes())
+				num, err := GetCurrentHealthyNodeNum()
+				if err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					w.Write(bytes.NewBufferString(fmt.Sprintf(`{"ERROR": "%v"`, err)).Bytes())
 				} else {
 					w.WriteHeader(http.StatusOK)
-					w.Write(bytes.NewBufferString(strconv.Itoa(GetCurrentHealthyNodeNum())).Bytes())
+					w.Write(bytes.NewBufferString(fmt.Sprintf(`{"Healthy_Nodes_Num": %d}`, num)).Bytes())
 				}
 			}
 		default:
