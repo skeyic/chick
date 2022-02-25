@@ -34,7 +34,7 @@ func (s *ClusterAPIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case "/health":
 			{
 				var health = "FALSE"
-				if s.owl.isHealthy() {
+				if IsHealthy() {
 					health = "TRUE"
 				}
 				w.WriteHeader(http.StatusOK)

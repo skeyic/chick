@@ -1192,6 +1192,7 @@ type ClusterAction int
 
 const (
 	ActionGetHealthyNodeNum ClusterAction = iota
+	ActionGetHealthStatus
 )
 
 type ClusterActionArgs struct {
@@ -1239,6 +1240,8 @@ func (o *Owl) RequestClusterAction(args ClusterActionArgs, reply *ClusterActionR
 	switch args.Action {
 	case ActionGetHealthyNodeNum:
 		reply.Body = o.healthChecker.getHealthyNodesNum()
+	case ActionGetHealthStatus:
+		reply.Body = o.isHealthy()
 	default:
 		reply.Error = errUnknownClusterAction
 	}

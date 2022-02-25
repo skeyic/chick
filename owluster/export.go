@@ -1,6 +1,7 @@
 package owluster
 
 import (
+	"github.com/golang/glog"
 	"log"
 	"net/http"
 )
@@ -48,6 +49,20 @@ func StartClusterAPIServer(port string) {
 			log.Fatal(err)
 		}
 	}()
+}
+
+func IsHealthy() bool {
+	if TheOWLNode.state == Leader {
+		return TheOWLNode.isHealthy()
+	}
+
+	replyBody, err := TheOWLNode.sendClusterActionToLeader(ActionGetHealthStatus)
+	if err != nil {
+		glog.Errorf("failed to get health status, err: %v", err)
+		return false
+	}
+
+	return replyBody.(bool)
 }
 
 func GetCurrentHealthyNodeNum() (int, error) {
