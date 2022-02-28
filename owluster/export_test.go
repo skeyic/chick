@@ -2,7 +2,6 @@ package owluster
 
 import (
 	"github.com/golang/glog"
-	"github.com/skeyic/chick/utils"
 	"testing"
 )
 
@@ -23,7 +22,7 @@ var (
 )
 
 func TestOWL1(t *testing.T) {
-	utils.EnableGlogForTesting()
+	EnableGlogForTesting()
 
 	JoinCluster(node1, cluster)
 	StartKVServer(kvPort1)
@@ -34,7 +33,7 @@ func TestOWL1(t *testing.T) {
 }
 
 func TestOWL2(t *testing.T) {
-	utils.EnableGlogForTesting()
+	EnableGlogForTesting()
 
 	JoinCluster(node2, cluster)
 	StartKVServer(kvPort2)
@@ -45,7 +44,7 @@ func TestOWL2(t *testing.T) {
 }
 
 func TestOWL3(t *testing.T) {
-	utils.EnableGlogForTesting()
+	EnableGlogForTesting()
 
 	JoinCluster(node3, cluster)
 	StartKVServer(kvPort3)
@@ -56,7 +55,7 @@ func TestOWL3(t *testing.T) {
 }
 
 func TestOWL4(t *testing.T) {
-	utils.EnableGlogForTesting()
+	EnableGlogForTesting()
 
 	JoinCluster(node4, cluster)
 	StartKVServer(kvPort4)

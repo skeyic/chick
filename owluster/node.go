@@ -448,7 +448,7 @@ func (o *Owl) rpc(port string) {
 	go http.Serve(lis, nil)
 }
 
-func (o *Owl) IncreaseTerm() {
+func (o *Owl) increaseTerm() {
 	o.currentTerm++
 	o.updateMyStatus()
 }
@@ -1180,7 +1180,7 @@ func (o *Owl) RequestJoin(args JoinArgs, reply *JoinReply) error {
 		}
 		o.clusterNodeStatsMap[args.Address] = newNodeStats(args.Address)
 		o.clusterLock.Unlock()
-		o.IncreaseTerm()
+		o.increaseTerm()
 
 		reply.JoinAccepted = true
 	}
