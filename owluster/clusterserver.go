@@ -66,7 +66,7 @@ func (s *ClusterAPIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						}
 
 						result.WriteString(fmt.Sprintf(`{"Node": "%s", "Health": %v, Term": %d, "Log_Index": %d, "Data_Processing": %v}`,
-							node.node, s.owl.healthChecker.isNodeHealthy(node.node), node.term, node.logIndex, node.dataProcessing))
+							node.node, s.owl.isNodeHealthy(node.node), node.term, node.logIndex, node.dataProcessing))
 
 						node.lock.RUnlock()
 					}
@@ -89,7 +89,7 @@ func (s *ClusterAPIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			{
 				w.WriteHeader(http.StatusBadRequest)
-				w.Write(bytes.NewBufferString(`{"ERROR": "Only support /health, /master, /nodes, healthy_nodes_num"`).Bytes())
+				w.Write(bytes.NewBufferString(`{"ERROR": "Only support /health, /master, /nodes, /healthy_nodes_num"}`).Bytes())
 			}
 		}
 

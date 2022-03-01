@@ -8,6 +8,6 @@ const (
 
 func EnableGlogForTesting() {
 	flag.Set("logtostderr", "true")
-	flag.Set("v", "10")
+	flag.Set("v", "4")
 	flag.Parse()
 }

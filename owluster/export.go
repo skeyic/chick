@@ -1,9 +1,11 @@
 package owluster
 
 import (
+	"encoding/json"
 	"github.com/golang/glog"
 	"log"
 	"net/http"
+	"time"
 )
 
 var (
@@ -51,6 +53,35 @@ func StartClusterAPIServer(port string) {
 	}()
 }
 
+func CleanValue(key string) {
+	var (
+		message = Message{
+			Key:    key,
+			Action: DeleteAction,
+		}
+	)
+
+	msg, _ := json.Marshal(message)
+	TheBeak.Eat(string(msg))
+}
+
+func SetValue(key, value string) {
+	var (
+		message = Message{
+			Key:    key,
+			Value:  value,
+			Action: UpdateAction,
+		}
+	)
+	msg, _ := json.Marshal(message)
+	TheBeak.Eat(string(msg))
+}
+
+func GetValue(key string) (bool, string) {
+	hit, value, _, _ := TheDataMap.Get(key)
+	return hit, value
+}
+
 func IsHealthy() bool {
 	if TheOWLNode.state == Leader {
 		return TheOWLNode.isHealthy()
@@ -76,4 +107,18 @@ func GetCurrentHealthyNodeNum() (int, error) {
 	}
 
 	return replyBody.(int), nil
+}
+
+// WaitForHealthy ...
+func WaitForHealthy() {
+	ticker := time.NewTicker(5 * time.Second)
+	for {
+		select {
+		case <-ticker.C:
+			if IsHealthy() {
+				return
+			}
+			glog.Warning("Cluster not ready")
+		}
+	}
 }

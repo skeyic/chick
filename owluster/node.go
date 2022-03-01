@@ -539,6 +539,9 @@ func (o *Owl) getNodesStatus() []*nodeStats {
 func (o *Owl) updateMyStatus() {
 	o.clusterLock.Lock()
 	status := o.clusterNodeStatsMap[o.me]
+	if status == nil {
+		status = newNodeStats(o.me)
+	}
 	status.lock.Lock()
 	status.logIndex = o.getLastLogIndex()
 	status.term = o.currentTerm
@@ -569,7 +572,7 @@ func (o *Owl) start() {
 	// state change and handle RPC
 	go o.step()
 	go o.serveChannels()
-	go o.debug()
+	//go o.debug()
 }
 
 func (o *Owl) step() {
@@ -682,6 +685,13 @@ func (o *Owl) debug() {
 			o.clusterLock.RUnlock()
 		}
 	}
+}
+
+func (o *Owl) isNodeHealthy(node string) bool {
+	if node == o.me {
+		return true
+	}
+	return o.healthChecker.isNodeHealthy(node)
 }
 
 func (o *Owl) processData(msg string) error {
